@@ -97,6 +97,66 @@ class PagedKVCache:
         )
         return dense_k, dense_v
 
+    def append(self, k_new: torch.Tensor, v_new: torch.Tensor) -> "PagedKVCache":
+        """Append dense KV tokens to the paged cache.
+
+        This portable implementation updates physical blocks and requantizes the
+        block store. It avoids rebuilding from a full dense `[batch, heads, seq,
+        dim]` tensor, while keeping the public behavior deterministic on CPU and
+        CUDA.
+        """
+
+        if k_new.ndim != 4 or v_new.ndim != 4:
+            raise ValueError("k_new and v_new must have shape [batch, heads, tokens, head_dim]")
+        if k_new.shape != v_new.shape:
+            raise ValueError("k_new and v_new must have the same shape")
+        if k_new.shape[0] != self.batch_size or k_new.shape[1] != self.num_heads or k_new.shape[3] != self.head_dim:
+            raise ValueError("new KV shape must match cache batch, heads, and head_dim")
+        append_tokens = int(k_new.shape[2])
+        if append_tokens <= 0:
+            raise ValueError("append token dimension must be non-empty")
+        if k_new.device != self.block_table.device or v_new.device != self.block_table.device:
+            raise ValueError("new KV tensors must be on the same device as the cache")
+
+        physical_k = dequantize_int8_per_block(self.k_quant, dtype=torch.float32).clone()
+        physical_v = dequantize_int8_per_block(self.v_quant, dtype=torch.float32).clone()
+        table = self.block_table.clone()
+        lengths = self.lengths.clone()
+
+        required_blocks = ((lengths + append_tokens + self.block_size - 1) // self.block_size).max()
+        required_cols = int(required_blocks.item())
+        if required_cols > table.shape[1]:
+            pad = table.new_full((self.batch_size, required_cols - table.shape[1]), -1)
+            table = torch.cat([table, pad], dim=1)
+
+        k_new = k_new.to(dtype=torch.float32)
+        v_new = v_new.to(dtype=torch.float32)
+        for batch_idx in range(self.batch_size):
+            start = int(lengths[batch_idx].item())
+            for token_idx in range(append_tokens):
+                position = start + token_idx
+                logical_block = position // self.block_size
+                block_offset = position % self.block_size
+                physical_idx = int(table[batch_idx, logical_block].item())
+                if physical_idx < 0:
+                    physical_idx = int(physical_k.shape[0])
+                    empty_shape = (1, self.num_heads, self.block_size, self.head_dim)
+                    physical_k = torch.cat([physical_k, physical_k.new_zeros(empty_shape)], dim=0)
+                    physical_v = torch.cat([physical_v, physical_v.new_zeros(empty_shape)], dim=0)
+                    table[batch_idx, logical_block] = physical_idx
+                physical_k[physical_idx, :, block_offset, :] = k_new[batch_idx, :, token_idx, :]
+                physical_v[physical_idx, :, block_offset, :] = v_new[batch_idx, :, token_idx, :]
+
+        lengths = lengths + append_tokens
+        return PagedKVCache(
+            k_quant=quantize_int8_per_block(physical_k, block_size=self.block_size),
+            v_quant=quantize_int8_per_block(physical_v, block_size=self.block_size),
+            block_table=table,
+            lengths=lengths,
+            block_size=self.block_size,
+            max_seq_len=int(lengths.max().item()),
+        )
+
     def estimated_bytes(self) -> int:
         table_bytes = self.block_table.numel() * self.block_table.element_size()
         length_bytes = self.lengths.numel() * self.lengths.element_size()

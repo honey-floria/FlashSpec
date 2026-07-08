@@ -57,6 +57,7 @@ def main() -> None:
             "dense_kv_bytes": float(2 * k.numel() * k.element_size()),
             "quant_kv_bytes": float(2 * k.numel() * k.element_size()),
             "compression_ratio": 1.0,
+            "materializes_dense_kv": 0.0,
         }
     elif args.backend == "fused":
         kq = quantize_int8_per_block(k, block_size=args.block_size)
@@ -100,6 +101,8 @@ def main() -> None:
         "estimated_dense_kv_bytes": stats["dense_kv_bytes"],
         "estimated_quant_kv_bytes": stats["quant_kv_bytes"],
         "compression_ratio": stats["compression_ratio"],
+        "materializes_dense_kv": bool(stats["materializes_dense_kv"]),
+        "bandwidth_fields_are_estimates": True,
         "effective_dense_kv_bandwidth_gbps": stats["dense_kv_bytes"] / max(1.0e-9, latency_ms / 1000.0) / 1.0e9,
         "effective_quant_kv_bandwidth_gbps": stats["quant_kv_bytes"] / max(1.0e-9, latency_ms / 1000.0) / 1.0e9,
         "output_checksum": float(out.float().sum().item()),

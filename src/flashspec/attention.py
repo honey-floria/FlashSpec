@@ -63,12 +63,13 @@ def fused_dequant_attention(
     out = reference_attention(q, k, v, lengths=lengths)
     if not return_stats:
         return out
-    dense_bytes = 2 * k.numel() * 2
+    dense_bytes = 2 * k.numel() * q.element_size()
     quant_bytes = estimate_quantized_bytes(k_quant) + estimate_quantized_bytes(v_quant)
     stats = {
         "dense_kv_bytes": float(dense_bytes),
         "quant_kv_bytes": float(quant_bytes),
         "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
+        "materializes_dense_kv": 1.0,
     }
     return out, stats
 
@@ -84,13 +85,13 @@ def paged_quant_attention(
     out = reference_attention(q, k, v, lengths=cache.lengths)
     if not return_stats:
         return out
-    dense_bytes = 2 * k.numel() * 2
+    dense_bytes = 2 * k.numel() * q.element_size()
     quant_bytes = cache.estimated_bytes()
     stats = {
         "dense_kv_bytes": float(dense_bytes),
         "quant_kv_bytes": float(quant_bytes),
         "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
         "physical_blocks": float(cache.block_table.ge(0).sum().item()),
+        "materializes_dense_kv": 1.0,
     }
     return out, stats
-

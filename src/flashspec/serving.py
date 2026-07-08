@@ -52,9 +52,7 @@ def run_decode_simulation(config: ServingConfig) -> Dict[str, float]:
         out = paged_quant_attention(q, cache)
         next_k = out.unsqueeze(2).to(k.dtype)
         next_v = torch.tanh(out).unsqueeze(2).to(v.dtype)
-        k = torch.cat([k, next_k], dim=2)
-        v = torch.cat([v, next_v], dim=2)
-        cache = PagedKVCache.from_dense(k, v, block_size=config.block_size)
+        cache = cache.append(next_k, next_v)
     synchronize(device)
     decode_ms = (perf_counter() - decode_start) * 1000.0
 

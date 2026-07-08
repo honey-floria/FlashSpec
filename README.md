@@ -1,6 +1,6 @@
 # FlashSpec
 
-FlashSpec 是一个面向 LLM decode 阶段的工程项目。它针对 decode attention 的显存带宽瓶颈，把 KV cache 存成 paged INT8 block，并在 attention 路径里融合反量化，减少 FP16 KV 从 HBM 到 SM 的搬运量。
+FlashSpec 是一个面向 LLM decode 阶段的工程项目。它的目标是针对 decode attention 的显存带宽瓶颈，把 KV cache 存成 paged INT8 block，并在 attention 路径里融合反量化，减少 FP16 KV 从 HBM 到 SM 的搬运量。
 
 本仓库对应 `doc/deep_engineering_project.svg` 里的技术地图：
 
@@ -9,7 +9,14 @@ FlashSpec 是一个面向 LLM decode 阶段的工程项目。它针对 decode at
 - Profiling：roofline 输入、latency breakdown、microbenchmark。
 - Serving：一个最小 decode loop，用来跑通 paged cache 路径。
 
-当前代码包含可移植 PyTorch 后端，方便在 CPU 和 CUDA 上验证 correctness 与 benchmark 流程。Triton 入口保留为兼容 wrapper，后续可以在同一 API 下替换成真正的自定义 Triton kernel。
+当前代码包含可移植 PyTorch 后端，方便在 CPU 和 CUDA 上验证 correctness、分页数据结构和 benchmark 流程。PyTorch 后端会 materialize dense KV；Triton 入口目前是兼容 wrapper，后续可以在同一 API 下替换成真正的自定义 Triton kernel。
+
+## 当前实现边界
+
+- `fused` 和 `paged` 后端当前用于验证 API、量化误差和分页寻址语义，不代表已经实现真实 fused CUDA/Triton kernel。
+- microbenchmark 输出的 bandwidth 字段是基于 KV 字节数的估算值，JSON 中的 `bandwidth_fields_are_estimates` 会标记这一点。
+- `materializes_dense_kv=true` 表示该后端在当前 PyTorch 实现里会先还原 dense KV，再执行 reference attention。
+- serving 模拟使用 paged cache 的增量 `append` 路径，不再在每个 decode step 从完整 dense KV 重新构建 cache；但 portable 后端仍会为了 correctness 反量化物理 block。
 
 ## Colab A100 快速开始
 
@@ -54,6 +61,7 @@ python -m unittest discover -s tests
 - 量化/反量化 round trip 的误差边界；
 - fused dequant attention 对齐 dense attention；
 - paged KV cache 能还原 dense KV；
+- paged KV cache append 后仍能还原和执行 attention；
 - paged attention 对齐非 paged 的 quantized attention。
 
 ## A100 Microbenchmark
@@ -84,7 +92,7 @@ python benchmarks/microbench.py --backend paged --batch 16 --heads 32 --seq-len 
 python benchmarks/microbench.py --backend paged --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --json --output results/a100_paged.json
 ```
 
-输出字段包括 `latency_ms`、`tokens_per_second`、估算 KV 读写字节数、压缩比，以及基于 KV 字节数估算的有效带宽。
+输出字段包括 `latency_ms`、`tokens_per_second`、估算 KV 读写字节数、压缩比、`materializes_dense_kv`，以及基于 KV 字节数估算的有效带宽。
 
 ## Batch × Seq Len Sweep
 
@@ -100,7 +108,7 @@ python benchmarks/sweep.py --batches 1,4,8,16 --seq-lens 512,1024,2048,4096 --he
 python benchmarks/e2e_serving.py --requests 32 --prompt-len 1024 --decode-steps 64 --heads 32 --head-dim 128 --json
 ```
 
-这不是模型质量 benchmark，而是系统路径 benchmark。它会重复构建 paged quant-KV cache 并执行 decode attention，输出 TTFT、TPOT 和 tokens/s。
+这不是模型质量 benchmark，而是系统路径 benchmark。它会构建初始 paged quant-KV cache，并在 decode loop 中通过 `append` 追加新 token，输出 TTFT、TPOT 和 tokens/s。
 
 ## Roofline SVG
 
@@ -131,6 +139,12 @@ scripts/
 tests/
   test_flashspec.py
 ```
+
+## 更多文档
+
+- `doc/README.MD`：设计背景、当前实现边界和推荐开发顺序。
+- `doc/TODO.MD`：按优先级拆分的后续工程任务、验收标准和里程碑。
+- `doc/deep_engineering_project.svg`：项目技术地图。
 
 ## 在 A100 上做真实 Profiling
 
