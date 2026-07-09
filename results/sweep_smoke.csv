@@ -1,0 +1,3 @@
+backend,batch,block_size,compression_ratio,device,device_name,dtype,effective_dense_kv_bandwidth_gbps,effective_quant_kv_bandwidth_gbps,estimated_dense_kv_bytes,estimated_quant_kv_bytes,head_dim,heads,iters,latency_ms,output_checksum,seq_len,tokens_per_second
+dense,1,16,1.0,cpu,cpu,float32,0.009543336250632526,0.009543336250632526,2048.0,2048.0,8,2,1,0.21460000425577164,2.3734889030456543,16,4659.832153629163
+paged,1,16,1.855072463768116,cpu,cpu,float32,0.0021562433867587075,0.0011623499506746157,1024.0,552.0,8,2,1,0.4749000072479248,2.374423027038574,16,2105.7064323815503

@@ -1,0 +1,22 @@
+{
+  "backend": "triton_fused",
+  "device": "cuda",
+  "device_name": "NVIDIA A100-SXM4-40GB",
+  "dtype": "float16",
+  "batch": 16,
+  "heads": 32,
+  "seq_len": 4096,
+  "head_dim": 128,
+  "block_size": 16,
+  "iters": 50,
+  "latency_ms": 0.7190891599998395,
+  "tokens_per_second": 22250.3701766323,
+  "estimated_dense_kv_bytes": 1073741824.0,
+  "estimated_quant_kv_bytes": 538443776.0,
+  "compression_ratio": 1.994157740993184,
+  "materializes_dense_kv": false,
+  "bandwidth_fields_are_estimates": true,
+  "effective_dense_kv_bandwidth_gbps": 1493.197066133273,
+  "effective_quant_kv_bandwidth_gbps": 748.7858334564801,
+  "output_checksum": 4.7987895011901855
+}
