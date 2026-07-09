@@ -13,10 +13,12 @@ from flashspec import (
     PagedKVCache,
     dequantize_int8_per_block,
     fused_dequant_attention,
+    fused_dequant_attention_triton,
     paged_quant_attention,
     quantize_int8_per_block,
     reference_attention,
 )
+from flashspec.triton_kernels import HAS_TRITON
 
 
 class FlashSpecTest(unittest.TestCase):
@@ -39,6 +41,32 @@ class FlashSpecTest(unittest.TestCase):
         expected = reference_attention(q, dequantize_int8_per_block(kq), dequantize_int8_per_block(vq))
         actual = fused_dequant_attention(q, kq, vq)
         torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
+
+    def test_triton_fused_wrapper_falls_back_on_cpu(self) -> None:
+        q = torch.randn(2, 3, 16)
+        k = torch.randn(2, 3, 25, 16)
+        v = torch.randn(2, 3, 25, 16)
+        kq = quantize_int8_per_block(k, block_size=8)
+        vq = quantize_int8_per_block(v, block_size=8)
+        expected = fused_dequant_attention(q, kq, vq)
+        actual, stats = fused_dequant_attention_triton(q, kq, vq, return_stats=True)
+        torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
+        self.assertEqual(stats["materializes_dense_kv"], 1.0)
+
+    @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
+    def test_triton_fused_attention_matches_dequant_reference_on_cuda(self) -> None:
+        device = torch.device("cuda")
+        dtype = torch.float16
+        q = torch.randn(2, 3, 64, device=device, dtype=dtype)
+        k = torch.randn(2, 3, 129, 64, device=device, dtype=dtype)
+        v = torch.randn(2, 3, 129, 64, device=device, dtype=dtype)
+        lengths = torch.tensor([129, 113], device=device, dtype=torch.int64)
+        kq = quantize_int8_per_block(k, block_size=16)
+        vq = quantize_int8_per_block(v, block_size=16)
+        expected = reference_attention(q, dequantize_int8_per_block(kq), dequantize_int8_per_block(vq), lengths=lengths)
+        actual, stats = fused_dequant_attention_triton(q, kq, vq, lengths=lengths, return_stats=True)
+        torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
+        self.assertEqual(stats["materializes_dense_kv"], 0.0)
 
     def test_paged_cache_reconstructs_dense_quantized_kv(self) -> None:
         k = torch.randn(2, 4, 23, 8)

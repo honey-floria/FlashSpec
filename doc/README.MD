@@ -25,16 +25,17 @@ FlashSpec 面向 LLM decode 阶段的 KV cache 带宽瓶颈。目标路径是：
 - paged KV cache 数据结构和 `block_table`；
 - dense reference attention；
 - fused/paged attention API；
+- Kernel 1 Triton fused dequant attention，可在 CUDA + Triton 环境中直接读取 INT8 K/V，并在 kernel 内完成反量化、QK、softmax 和 PV；
 - decode serving loop 模拟；
 - microbenchmark、sweep 和 roofline SVG 脚本。
 
-需要注意：当前 `fused` 和 `paged` 路径仍会反量化并还原 dense KV，再调用 reference attention。它们适合验证 API 和数值正确性，但还不是高性能 Triton/CUDA kernel。
+需要注意：`fused` 是 portable PyTorch 路径，仍会反量化并还原 dense KV，再调用 reference attention；`triton_fused` 是 Kernel 1 的 Triton 路径，主路径不 materialize dense KV。`paged` 路径仍会通过 `cache.to_dense()` 还原 KV，Kernel 2 还需要继续实现。
 
 ## 关键边界
 
 - benchmark 中的 bandwidth 字段是估算值，不是 Nsight Compute 实测值。
 - `materializes_dense_kv=true` 表示该路径仍会创建 dense KV 中间结果。
-- `triton_kernels.py` 当前只是兼容入口，尚未实现自定义 Triton kernel。
+- `triton_kernels.py` 已包含 Kernel 1 的 Triton fused dequant attention；Kernel 2 的 paged Triton kernel 尚未实现。
 - serving 模拟已经支持 cache append，但 portable append 仍会重新量化物理 block store；真实 serving 还需要 allocator/free list 和 request 生命周期管理。
 
 ## 推荐开发顺序
