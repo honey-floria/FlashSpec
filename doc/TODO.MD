@@ -43,25 +43,25 @@
 
 ## P1：Profiling 和 Benchmark 可信化
 
-### 3. 增加真实 CUDA timing 和 profiler 指标
+### 3. [x] 增加真实 CUDA timing 和 profiler 指标
 
-当前 bandwidth 是基于 KV 字节数估算。下一步需要把 benchmark 结果分成“估算字段”和“实测字段”：
+已在 `benchmarks/microbench.py` 和 `benchmarks/sweep.py` 中把 benchmark 结果拆成“估算字段”和“实测字段”：
 
-- 使用 CUDA event 记录 kernel latency；
-- 增加 warmup、repeat、median/p50/p90；
-- 支持保存 raw measurements；
-- 添加 Nsight Compute 命令模板；
-- 记录 dram bytes、achieved bandwidth、occupancy、SM utilization。
+- CUDA 路径使用 `torch.cuda.Event` 记录 GPU stream 上的实际耗时，CPU 路径继续使用 `perf_counter`；
+- 增加 `--warmup`、`--repeats`，输出 `latency_mean_ms`、`latency_std_ms`、`latency_p50_ms`、`latency_p90_ms`、`latency_p99_ms`；
+- `--include-raw` 可把 raw latency 写入 JSON，`--raw-output` 可单独保存 raw measurements；
+- JSON 内写入可复制的 `nsight_compute_command`，用于在 A100/Colab 等 CUDA 环境采集 profiler；
+- 新增 `estimated_*` bandwidth 字段和 `measured_*` profiler 字段，`dram bytes`、`achieved bandwidth`、`occupancy`、`SM utilization` 当前先置为 `null`，需要运行 Nsight Compute 后回填。
 
 验收标准：
 
-- JSON 输出区分 `estimated_*` 和 `measured_*`；
-- sweep CSV 可直接画 latency/tokens/s/bandwidth 曲线；
-- README 中有一条可复现实验命令。
+- [x] JSON 输出区分 `estimated_*` 和 `measured_*`；
+- [x] sweep CSV 可直接画 latency/tokens/s/bandwidth 曲线；
+- [x] README 中有可复现实验命令和 profiling report 生成命令。
 
-### 4. 完善 latency breakdown
+### 4. [x] 完善 latency breakdown
 
-目标是解释性能来自哪里，而不只是给一个总耗时：
+已在 microbenchmark JSON 中新增 `latency_breakdown`，用于解释性能主要消耗在哪些阶段，而不只是给一个总耗时：
 
 - KV load；
 - dequant；
@@ -70,10 +70,21 @@
 - PV accumulation；
 - output write。
 
+每个阶段都会输出：
+
+- `stage`：阶段名称；
+- `estimated_bytes`：该阶段粗粒度字节访问估算；
+- `estimated_flops_or_ops`：该阶段粗粒度算术或操作量估算；
+- `measurement`：建议用 Nsight Compute 采集的指标类型；
+- `notes`：中文说明，包括 portable quant backend 会物化 dense KV，而 Triton quant backend 不物化 dense KV。
+
+同时新增 `scripts/profile_report.py`，可以把 microbenchmark JSON 转成 Markdown profiling report，便于查看 `nsight_compute_command`、阶段 breakdown 和 profiler 字段。
+
 验收标准：
 
-- profiler 报告能对应到上述阶段；
-- benchmark 文档说明每个阶段的瓶颈判断。
+- [x] profiler 报告能对应到上述阶段；
+- [x] benchmark 文档说明每个阶段的瓶颈判断；
+- [x] 当前阶段 breakdown 是“阶段定义 + 工作量估算 + profiler 映射”，真实 per-stage latency 仍需要运行 Nsight Compute 的 source-line/instruction/memory metrics 后归因。
 
 ## P1：Serving 模拟接近真实系统
 

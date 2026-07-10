@@ -14,9 +14,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep FlashSpec batch and sequence shapes")
     parser.add_argument("--batches", default="1,2,4")
     parser.add_argument("--seq-lens", default="128,512,1024")
+    parser.add_argument("--backends", default="dense,paged")
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
     parser.add_argument("--output", type=Path, default=Path("results/sweep.csv"))
@@ -27,11 +30,15 @@ def _ints(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def _strings(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def main() -> None:
     args = parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str]] = []
-    for backend in ("dense", "paged"):
+    for backend in _strings(args.backends):
         for batch in _ints(args.batches):
             for seq_len in _ints(args.seq_lens):
                 command = [
@@ -49,6 +56,10 @@ def main() -> None:
                     str(args.head_dim),
                     "--iters",
                     str(args.iters),
+                    "--warmup",
+                    str(args.warmup),
+                    "--repeats",
+                    str(args.repeats),
                     "--device",
                     args.device,
                     "--dtype",
