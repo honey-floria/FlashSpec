@@ -25,9 +25,9 @@
 - 在 A100 上至少覆盖 `head_dim=64/128`、`seq_len=512/2048/4096`；
 - benchmark 能对比 dense、portable fused、Triton fused 三条路径。
 
-### 2. 实现 Kernel 2：paged INT8 KV attention
+### 2. [x] 实现 Kernel 2：paged INT8 KV attention
 
-当前 `paged_quant_attention` 仍通过 `cache.to_dense()` 还原 KV。需要让 kernel 直接按 `block_table` 间接寻址物理 block：
+已在 `src/flashspec/triton_kernels.py` 中实现 `paged_quant_attention_triton`：
 
 - 支持 `block_table[b, logical_block] -> physical_block`；
 - 支持非整除 `seq_len` 和最后一个 partial block；
@@ -36,9 +36,10 @@
 
 验收标准：
 
-- paged backend 不调用 `cache.to_dense()`；
+- `triton_paged` backend 不调用 `cache.to_dense()`；
 - variable length case 与 reference attention 对齐；
-- Nsight 中能看到实际读取的是 INT8 KV block，而不是 dense KV tensor。
+- `materializes_dense_kv=false` 的 paged Triton backend 可运行；
+- Nsight 中能看到实际读取的是 INT8 KV block，而不是 dense KV tensor。这个 profiling 证据仍需要在 P1 profiling 任务中补充。
 
 ## P1：Profiling 和 Benchmark 可信化
 

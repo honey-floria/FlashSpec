@@ -16,6 +16,7 @@ from flashspec import (
     fused_dequant_attention,
     fused_dequant_attention_triton,
     paged_quant_attention,
+    paged_quant_attention_triton,
     quantize_int8_per_block,
     reference_attention,
 )
@@ -31,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--backend", choices=["dense", "fused", "triton_fused", "paged"], default="paged")
+    parser.add_argument("--backend", choices=["dense", "fused", "triton_fused", "paged", "triton_paged"], default="paged")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
     parser.add_argument("--json", action="store_true")
@@ -82,13 +83,25 @@ def main() -> None:
             return fused_dequant_attention_triton(q, kq, vq)
 
         _, stats = fused_dequant_attention_triton(q, kq, vq, return_stats=True)
-    else:
+    elif args.backend == "paged":
         cache = PagedKVCache.from_dense(k, v, block_size=args.block_size)
 
         def run() -> torch.Tensor:
             return paged_quant_attention(q, cache)
 
         _, stats = paged_quant_attention(q, cache, return_stats=True)
+    else:
+        if not HAS_TRITON:
+            raise RuntimeError("triton_paged backend 需要安装 Triton：python -m pip install -e \".[triton]\"")
+        if device.type != "cuda":
+            raise RuntimeError("triton_paged backend 需要 CUDA 设备，请使用 --device cuda 或 --device auto")
+
+        cache = PagedKVCache.from_dense(k, v, block_size=args.block_size)
+
+        def run() -> torch.Tensor:
+            return paged_quant_attention_triton(q, cache)
+
+        _, stats = paged_quant_attention_triton(q, cache, return_stats=True)
 
     for _ in range(2):
         run()
