@@ -8,26 +8,26 @@
 
 ## P0：核心 Kernel 闭环
 
-### 1. 实现 Kernel 1：INT8 KV fused dequant attention
+### 1. [x] 实现 Kernel 1：INT8 KV fused dequant attention
 
-当前 `src/flashspec/triton_kernels.py` 只是 wrapper，`fused_dequant_attention` 会先 materialize dense KV。需要实现真正的 Triton/CUDA kernel：
+已在 `src/flashspec/triton_fused.py` 中实现 `fused_dequant_attention_triton`，并通过 `src/flashspec/triton_kernels.py` 保持兼容导出。portable `fused_dequant_attention` 仍会 materialize dense KV，Triton 主路径满足：
 
 - 从 INT8 K/V block 直接 load；
-- 在寄存器或 shared memory 中完成 dequant；
-- 完成 QK、softmax、PV；
+- 在寄存器中完成 dequant；
+- 完成 QK、online softmax、PV；
 - 输出 `[batch, heads, head_dim]`；
 - 主路径不落地 dense FP16/FP32 KV。
 
 验收标准：
 
-- `materializes_dense_kv=false` 的 fused backend 可运行；
-- 输出与 PyTorch reference 在合理误差内对齐；
-- 在 A100 上至少覆盖 `head_dim=64/128`、`seq_len=512/2048/4096`；
-- benchmark 能对比 dense、portable fused、Triton fused 三条路径。
+- [x] `materializes_dense_kv=false` 的 fused backend 可运行（CUDA + Triton）；
+- [x] 输出与 PyTorch reference 在合理误差内对齐（见 `tests/test_flashspec.py` 中的 CUDA 用例，`rtol/atol=2e-2`）；
+- [ ] 在真实 A100 上覆盖 `head_dim=64/128`、`seq_len=512/2048/4096` 并沉淀 benchmark 数据；
+- [x] benchmark 能对比 dense、portable fused、Triton fused 三条路径（`benchmarks/microbench.py --backend {dense,fused,triton_fused}`）。
 
 ### 2. [x] 实现 Kernel 2：paged INT8 KV attention
 
-已在 `src/flashspec/triton_kernels.py` 中实现 `paged_quant_attention_triton`：
+已在 `src/flashspec/triton_paged.py` 中实现 `paged_quant_attention_triton`，并通过 `src/flashspec/triton_kernels.py` 保持兼容导出：
 
 - 支持 `block_table[b, logical_block] -> physical_block`；
 - 支持非整除 `seq_len` 和最后一个 partial block；
@@ -219,17 +219,18 @@ benchmark 结果未来会用于画图和对比，需要稳定字段：
 - 完成 variable length 和 append 边界测试；
 - 文档明确实现边界。
 
-### Milestone 2：Kernel 1 可用
+### Milestone 2：Kernel 1 可用（代码已完成，待 A100 数据）
 
-- Triton fused dequant attention 可运行；
-- 与 reference 对齐；
-- A100 上完成 dense vs fused 对比。
+- [x] Triton fused dequant attention 可运行；
+- [x] 与 reference 对齐（CUDA 用例通过）；
+- [ ] A100 上完成 dense vs fused 对比并保存结果。
 
-### Milestone 3：Kernel 2 可用
+### Milestone 3：Kernel 2 可用（代码已完成，待 A100 数据）
 
-- paged Triton attention 支持 `block_table`；
-- 支持 variable lengths；
-- 证明不 materialize dense KV。
+- [x] paged Triton attention 支持 `block_table`；
+- [x] 支持 variable lengths；
+- [x] 证明不 materialize dense KV（`materializes_dense_kv=false`）；
+- [ ] A100 上采集 Nsight 证据，确认读取的是 INT8 KV block。
 
 ### Milestone 4：Serving benchmark
 

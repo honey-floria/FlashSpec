@@ -39,7 +39,7 @@ FlashSpec 面向 LLM decode 阶段的 KV cache 带宽瓶颈。目标路径是：
 - JSON 中的 `measured_kernel_latency_ms` 来自 CUDA event；`measured_dram_bytes`、`measured_achieved_bandwidth_gbps`、`measured_occupancy_pct`、`measured_sm_utilization_pct` 仍需要运行 JSON 里的 `nsight_compute_command` 后回填。
 - `latency_breakdown` 是 decode attention 的阶段定义和粗粒度工作量估算，覆盖 KV load、dequant、QK、softmax、PV accumulation、output write；真正的每阶段 latency 需要 Nsight Compute source-line/instruction/memory metrics 进一步归因。
 - `materializes_dense_kv=true` 表示该路径仍会创建 dense KV 中间结果。
-- `triton_kernels.py` 已包含 Kernel 1 fused dequant attention 和 Kernel 2 paged INT8 KV attention 的 Triton 实现。
+- Triton 相关代码已按功能拆分：`triton_fused.py` 实现 Kernel 1 fused dequant attention，`triton_paged.py` 实现 Kernel 2 paged INT8 KV attention，`triton_utils.py` 负责可选 Triton 导入和共享工具，`triton_kernels.py` 只保留兼容导出入口。
 - serving 模拟已经支持 cache append，但 portable append 仍会重新量化物理 block store；真实 serving 还需要 allocator/free list 和 request 生命周期管理。
 
 ## Profiling 使用方式
@@ -60,10 +60,10 @@ python scripts/profile_report.py results/a100_triton_paged.json --output results
 
 ## 推荐开发顺序
 
-1. 先完成 Kernel 1：非 paged INT8 KV fused dequant attention。
-2. 再完成 Kernel 2：加入 `block_table` 的 paged INT8 KV attention。
+1. [x] Kernel 1：非 paged INT8 KV fused dequant attention（`triton_fused.py`）。
+2. [x] Kernel 2：加入 `block_table` 的 paged INT8 KV attention（`triton_paged.py`）。
 3. 扩展 serving 模拟，支持 variable length、block allocator、request 完成和新增。
 4. 补齐 CUDA、FP16/BF16、边界 shape 和 benchmark schema 测试。
 5. 在真实 A100 环境运行 Nsight Compute，回填 `measured_*` profiler 指标并沉淀实验报告。
 
-详细任务见 `TODO.MD`。
+Kernel 1、2 的代码路径已经完成并在 CUDA + Triton 下有对齐测试；当前重心在第 3~5 步：把 serving 做得更接近真实系统、扩大测试矩阵，并在真实 A100 上采集 profiler 数据。详细任务见 `TODO.MD`。
