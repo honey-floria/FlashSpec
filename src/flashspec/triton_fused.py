@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import math
+import os
 
 import torch
 
@@ -342,7 +343,25 @@ def _compute_num_splits(seq_len: int, block_n: int) -> int:
 
     S==1 时退化回单 kernel 快路径（零 combine 开销）。短序列(512)→1，
     2048→4，4096→8。段太多不划算，故用 S_MAX 封顶。
+
+    A/B 开关：环境变量 FLASHSPEC_NUM_SPLITS 可覆盖自适应值，用于在
+    num_warps 固定的前提下隔离 Split-K 的纯贡献：
+    - FLASHSPEC_NUM_SPLITS=1  强制关闭 Split-K（走单 kernel 快路径）；
+    - FLASHSPEC_NUM_SPLITS=8  强制 8 段；
+    - 未设置或非法值           走自适应逻辑。
+    S 会被 clamp 到 [1, seq_len 能切出的最大段数]，避免空段过多。
     """
+
+    override = os.environ.get("FLASHSPEC_NUM_SPLITS")
+    if override is not None:
+        try:
+            forced = int(override)
+        except ValueError:
+            forced = 0
+        if forced >= 1:
+            # 每段至少覆盖 block_n 个 token，否则切出的段是纯空段。
+            max_splits = max(1, (seq_len + block_n - 1) // block_n)
+            return max(1, min(forced, max_splits))
 
     if seq_len <= _TOKENS_PER_SPLIT:
         return 1

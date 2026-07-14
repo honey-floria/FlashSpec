@@ -436,6 +436,9 @@ def main() -> None:
         "estimated_quant_kv_bytes": stats["quant_kv_bytes"],
         "compression_ratio": stats["compression_ratio"],
         "materializes_dense_kv": bool(stats["materializes_dense_kv"]),
+        # Split-K 段数：仅 triton_fused 会给出。None=该 backend 无此概念，
+        # 1=走单 kernel 快路径，>1=走 split+combine 路径。用于验证 Split-K 是否生效。
+        "num_splits": stats.get("num_splits"),
         "bandwidth_fields_are_estimates": True,
         "estimated_effective_dense_kv_bandwidth_gbps": dense_bandwidth,
         "estimated_effective_quant_kv_bandwidth_gbps": quant_bandwidth,
