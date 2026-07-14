@@ -249,9 +249,10 @@ def _run_paged_quant_attention_triton(
         1.0 / math.sqrt(float(head_dim)),
         block_n,
         block_d,
-        # num_warps=8：与 fused kernel 同理，grid=batch*heads 太小导致 occupancy ~25%，
-        # 提到 8 warps 拉高 occupancy 与并发访存，详见 triton_fused.py 的说明。
-        num_warps=8,
+        # num_warps=4：A100 实测 num_warps=8 相比 4 全面变慢（每 program 活量太小，
+        # 跨 warp 归约开销翻倍）。paged 提升 occupancy 的正路是 Split-K（见
+        # doc/split-k-plan.md），待 fused 的 Split-K 在 A100 验证后再复制到 paged。
+        num_warps=4,
     )
 
     if not return_stats:

@@ -137,6 +137,159 @@ if HAS_TRITON:
         # 输出布局是 [batch, heads, head_dim]，与 q 一致。
         tl.store(out_ptr + q_base + offs_d, out, mask=d_mask)
 
+    @triton.jit
+    def _fused_dequant_attention_split_kernel(
+        q_ptr,
+        k_values_ptr,
+        k_scale_ptr,
+        k_zero_point_ptr,
+        v_values_ptr,
+        v_scale_ptr,
+        v_zero_point_ptr,
+        lengths_ptr,
+        partial_m_ptr,
+        partial_l_ptr,
+        partial_acc_ptr,
+        heads: tl.constexpr,
+        seq_len: tl.constexpr,
+        head_dim: tl.constexpr,
+        n_blocks: tl.constexpr,
+        block_size: tl.constexpr,
+        sm_scale: tl.constexpr,
+        has_lengths: tl.constexpr,
+        num_splits: tl.constexpr,
+        chunk_tokens: tl.constexpr,
+        block_n: tl.constexpr,
+        block_d: tl.constexpr,
+    ) -> None:
+        """Split-K split kernel：grid=(batch*heads, num_splits)。
+
+        与单 kernel 的唯一区别：每个 program 只扫自己那段 token
+        `[split_id*chunk_tokens, (split_id+1)*chunk_tokens)`，产出该段的
+        online-softmax 部分状态 (partial_m, partial_l, partial_acc) 写入 scratch，
+        不直接写 out。合并交给 _combine_splits_kernel。
+
+        chunk_tokens 由 launcher 保证是 block_n 的整数倍，因此内层循环覆盖的范围
+        恰好等于本段 token 区间，尾部用 effective_len mask 处理不整除。
+        """
+
+        pid = tl.program_id(0)
+        split_id = tl.program_id(1)
+
+        batch_idx = pid // heads
+        head_idx = pid - batch_idx * heads
+
+        offs_d = tl.arange(0, block_d)
+        d_mask = offs_d < head_dim
+
+        q_base = (batch_idx * heads + head_idx) * head_dim
+        q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+
+        effective_len = seq_len
+        if has_lengths:
+            loaded_len = tl.load(lengths_ptr + batch_idx)
+            effective_len = tl.minimum(loaded_len, seq_len)
+
+        # 本段负责的 token 区间。split_end 不超过 seq_len。
+        split_start = split_id * chunk_tokens
+        split_end = tl.minimum(split_start + chunk_tokens, seq_len)
+
+        m = tl.full((), -3.4028234663852886e38, tl.float32)
+        l = tl.full((), 0.0, tl.float32)
+        acc = tl.zeros((block_d,), tl.float32)
+
+        # 只扫本段。chunk_tokens 是 block_n 的整数倍，循环次数编译期已知。
+        for local in range(0, chunk_tokens, block_n):
+            offs_s = split_start + local + tl.arange(0, block_n)
+            s_mask = (offs_s < effective_len) & (offs_s < split_end)
+
+            quant_block = offs_s // block_size
+            block_offset = offs_s - quant_block * block_size
+
+            kv_offsets = (
+                ((((batch_idx * heads + head_idx) * n_blocks + quant_block[:, None]) * block_size + block_offset[:, None])
+                 * head_dim)
+                + offs_d[None, :]
+            )
+            kv_mask = s_mask[:, None] & d_mask[None, :]
+
+            qparam_offsets = (batch_idx * heads + head_idx) * n_blocks + quant_block
+            k_scale = tl.load(k_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
+            k_zero = tl.load(k_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
+            k_i8 = tl.load(k_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
+            k_deq = (k_i8 + 128.0 - k_zero[:, None]) * k_scale[:, None]
+
+            scores = tl.sum(k_deq * q[None, :], axis=1) * sm_scale
+            scores = tl.where(s_mask, scores, -3.4028234663852886e38)
+
+            block_m = tl.max(scores, axis=0)
+            new_m = tl.maximum(m, block_m)
+            old_scale = tl.exp(m - new_m)
+            probs = tl.exp(scores - new_m)
+            probs = tl.where(s_mask, probs, 0.0)
+            new_l = l * old_scale + tl.sum(probs, axis=0)
+
+            v_scale = tl.load(v_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
+            v_zero = tl.load(v_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
+            v_i8 = tl.load(v_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
+            v_deq = (v_i8 + 128.0 - v_zero[:, None]) * v_scale[:, None]
+
+            acc = acc * old_scale + tl.sum(probs[:, None] * v_deq, axis=0)
+            m = new_m
+            l = new_l
+
+        # 写出本段 partial 状态到 scratch，供 combine kernel 合并。
+        # partial_m/l 布局 [batch*heads, num_splits]，partial_acc 布局 [..., head_dim]。
+        out_idx = pid * num_splits + split_id
+        tl.store(partial_m_ptr + out_idx, m)
+        tl.store(partial_l_ptr + out_idx, l)
+        tl.store(partial_acc_ptr + out_idx * head_dim + offs_d, acc, mask=d_mask)
+
+    @triton.jit
+    def _combine_splits_kernel(
+        partial_m_ptr,
+        partial_l_ptr,
+        partial_acc_ptr,
+        out_ptr,
+        num_splits: tl.constexpr,
+        head_dim: tl.constexpr,
+        block_d: tl.constexpr,
+    ) -> None:
+        """Split-K combine：把某个 [batch, head] 的 S 段 partial 状态合并成最终输出。
+
+        每个 program 负责一个 [batch, head]，读取自己 S 段的 (partial_m, partial_l,
+        partial_acc)，做跨段 online-softmax rescale。数学与 kernel 内跨 block 的
+        合并完全同构，只是这里跨的是 split 段。
+        """
+
+        pid = tl.program_id(0)
+        offs_d = tl.arange(0, block_d)
+        d_mask = offs_d < head_dim
+
+        m = tl.full((), -3.4028234663852886e38, tl.float32)
+        l = tl.full((), 0.0, tl.float32)
+        acc = tl.zeros((block_d,), tl.float32)
+
+        # 逐段合并。空段的 partial_m=-FLT_MAX、partial_l=0，rescale 后贡献为 0，
+        # 不会污染结果；全空时 l 保持 0，最后走除零保护输出 0。
+        for s in range(0, num_splits):
+            idx = pid * num_splits + s
+            pm = tl.load(partial_m_ptr + idx)
+            pl = tl.load(partial_l_ptr + idx)
+            pacc = tl.load(partial_acc_ptr + idx * head_dim + offs_d, mask=d_mask, other=0.0)
+
+            new_m = tl.maximum(m, pm)
+            old_scale = tl.exp(m - new_m)
+            cur_scale = tl.exp(pm - new_m)
+            l = l * old_scale + pl * cur_scale
+            acc = acc * old_scale + pacc * cur_scale
+            m = new_m
+
+        denom = tl.where(l > 0.0, l, 1.0)
+        out = acc / denom
+        out = tl.where(l > 0.0, out, 0.0)
+        tl.store(out_ptr + pid * head_dim + offs_d, out, mask=d_mask)
+
 
 def _validate_triton_fused_inputs(
     q: torch.Tensor,
@@ -178,6 +331,25 @@ def _validate_triton_fused_inputs(
         raise ValueError("Triton fused attention 当前只支持 head_dim <= 256")
 
 
+# Split-K 自适应参数（见 doc/split-k-plan.md）。
+# TOKENS_PER_SPLIT：每段目标 token 数；S_MAX：段数上限，防止 scratch 过大。
+_TOKENS_PER_SPLIT = 512
+_S_MAX = 32
+
+
+def _compute_num_splits(seq_len: int, block_n: int) -> int:
+    """自适应 S = clamp(ceil(seq_len / TOKENS_PER_SPLIT), 1, S_MAX)。
+
+    S==1 时退化回单 kernel 快路径（零 combine 开销）。短序列(512)→1，
+    2048→4，4096→8。段太多不划算，故用 S_MAX 封顶。
+    """
+
+    if seq_len <= _TOKENS_PER_SPLIT:
+        return 1
+    s = (seq_len + _TOKENS_PER_SPLIT - 1) // _TOKENS_PER_SPLIT
+    return max(1, min(s, _S_MAX))
+
+
 def _run_fused_dequant_attention_triton(
     q: torch.Tensor,
     k_quant: QuantizedTensor,
@@ -214,32 +386,82 @@ def _run_fused_dequant_attention_triton(
     # 能控制单个 program 的寄存器/临时矩阵规模，同时覆盖长 seq_len 的循环扫描。
     block_n = 64
     out = torch.empty_like(q_contig)
+    sm_scale = 1.0 / math.sqrt(float(head_dim))
 
-    grid = (batch * heads,)
-    _fused_dequant_attention_kernel[grid](
-        q_contig,
-        k_values,
-        k_scale,
-        k_zero,
-        v_values,
-        v_scale,
-        v_zero,
-        lengths_contig,
-        out,
-        heads,
-        seq_len,
-        head_dim,
-        n_blocks,
-        block_size,
-        1.0 / math.sqrt(float(head_dim)),
-        lengths is not None,
-        block_n,
-        block_d,
-        # num_warps=8：grid 只有 batch*heads(=512) 个 program，A100 有 108 个 SM，
-        # 单 program 4 warps 时每 SM 仅 ~19 warps（occupancy ~25%）。提到 8 warps
-        # 可把 occupancy 拉到 ~59%，增加并发访存请求以更好地打满 HBM 带宽。
-        num_warps=8,
-    )
+    num_splits = _compute_num_splits(seq_len, block_n)
+
+    if num_splits == 1:
+        # S==1 快路径：直接用原单 kernel 写 out，不分配 scratch、不启 combine。
+        grid = (batch * heads,)
+        _fused_dequant_attention_kernel[grid](
+            q_contig,
+            k_values,
+            k_scale,
+            k_zero,
+            v_values,
+            v_scale,
+            v_zero,
+            lengths_contig,
+            out,
+            heads,
+            seq_len,
+            head_dim,
+            n_blocks,
+            block_size,
+            sm_scale,
+            lengths is not None,
+            block_n,
+            block_d,
+            # num_warps=4：A100 实测 num_warps=8 相比 4 全面变慢（每 program 活量
+            # 太小，跨 warp 归约开销翻倍）。长序列走下方 Split-K 分支填满 SM。
+            num_warps=4,
+        )
+    else:
+        # Split-K：把 seq_len 切成 num_splits 段并行，grid=(batch*heads, S)。
+        # chunk_tokens 向上取整到 block_n 的整数倍，使 split kernel 内层循环恰好
+        # 覆盖本段，尾段用 mask 处理不整除。
+        chunk_tokens = ((seq_len + num_splits - 1) // num_splits + block_n - 1) // block_n * block_n
+        rows = batch * heads
+        # scratch：partial 状态，不是 dense KV。s4096/d128,S=8 时 acc ≈ 16.8MB。
+        partial_m = torch.empty((rows, num_splits), device=q_contig.device, dtype=torch.float32)
+        partial_l = torch.empty((rows, num_splits), device=q_contig.device, dtype=torch.float32)
+        partial_acc = torch.empty((rows, num_splits, head_dim), device=q_contig.device, dtype=torch.float32)
+
+        _fused_dequant_attention_split_kernel[(rows, num_splits)](
+            q_contig,
+            k_values,
+            k_scale,
+            k_zero,
+            v_values,
+            v_scale,
+            v_zero,
+            lengths_contig,
+            partial_m,
+            partial_l,
+            partial_acc,
+            heads,
+            seq_len,
+            head_dim,
+            n_blocks,
+            block_size,
+            sm_scale,
+            lengths is not None,
+            num_splits,
+            chunk_tokens,
+            block_n,
+            block_d,
+            num_warps=4,
+        )
+        _combine_splits_kernel[(rows,)](
+            partial_m,
+            partial_l,
+            partial_acc,
+            out,
+            num_splits,
+            head_dim,
+            block_d,
+            num_warps=4,
+        )
 
     if not return_stats:
         return out
@@ -251,6 +473,8 @@ def _run_fused_dequant_attention_triton(
         "quant_kv_bytes": float(quant_bytes),
         "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
         "materializes_dense_kv": 0.0,
+        # Split-K 段数：1 表示走单 kernel 快路径，>1 表示 split+combine 路径。
+        "num_splits": float(num_splits),
     }
     return out, stats
 

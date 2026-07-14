@@ -69,6 +69,26 @@ class FlashSpecTest(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
         self.assertEqual(stats["materializes_dense_kv"], 0.0)
 
+    @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
+    def test_triton_fused_split_k_matches_reference_on_cuda(self) -> None:
+        # seq_len=1500 > TOKENS_PER_SPLIT(512) 强制 num_splits>1，确保 Split-K
+        # 的 split+combine 路径被测到；variable lengths 覆盖尾段 mask。
+        device = torch.device("cuda")
+        dtype = torch.float16
+        q = torch.randn(2, 4, 128, device=device, dtype=dtype)
+        k = torch.randn(2, 4, 1500, 128, device=device, dtype=dtype)
+        v = torch.randn(2, 4, 1500, 128, device=device, dtype=dtype)
+        lengths = torch.tensor([1500, 977], device=device, dtype=torch.int64)
+        kq = quantize_int8_per_block(k, block_size=16)
+        vq = quantize_int8_per_block(v, block_size=16)
+        expected = reference_attention(
+            q, dequantize_int8_per_block(kq), dequantize_int8_per_block(vq), lengths=lengths
+        )
+        actual, stats = fused_dequant_attention_triton(q, kq, vq, lengths=lengths, return_stats=True)
+        torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
+        self.assertEqual(stats["materializes_dense_kv"], 0.0)
+        self.assertGreater(stats["num_splits"], 1.0)
+
     def test_paged_cache_reconstructs_dense_quantized_kv(self) -> None:
         k = torch.randn(2, 4, 23, 8)
         v = torch.randn(2, 4, 23, 8)
