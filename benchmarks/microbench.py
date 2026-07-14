@@ -24,6 +24,17 @@ from flashspec import (
 )
 from flashspec.runtime import device_name, resolve_device, resolve_dtype, synchronize
 from flashspec.triton_kernels import HAS_TRITON
+from flashspec.ncu_parse import parse_ncu_csv
+
+# 回填 measured_* 字段所需的最小 ncu metric 集合（与 ncu_parse 对齐）。
+NCU_METRICS = (
+    "dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,"
+    "sm__warps_active.avg.pct_of_peak_sustained_active,"
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed,"
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed"
+)
+# 默认只 profile 这么多次 launch（warmup 之后），控制 ncu 开销。
+NCU_LAUNCH_COUNT = 5
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -102,17 +113,72 @@ def _nsight_compute_command(args: argparse.Namespace) -> str:
     """
 
     output = f"results/ncu_{args.backend}_b{args.batch}_h{args.heads}_s{args.seq_len}_d{args.head_dim}"
+    # 只采集回填 measured_* 需要的 metric，不用 `--set full`：full 会把每个 kernel
+    # 重放几十次，在 Colab 上极慢甚至超时。`-s`/`-c` 跳过 warmup、只 profile 少量
+    # launch，进一步压缩开销。
     return (
-        "ncu --set full "
-        "--metrics dram__bytes_read.sum,dram__bytes_write.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,"
-        "sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active,"
-        "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum "
-        f"--target-processes all --export {output} --force-overwrite "
+        f"ncu --metrics {NCU_METRICS} "
+        f"--launch-skip {max(1, args.warmup)} --launch-count {NCU_LAUNCH_COUNT} "
+        f"--target-processes all --export {output} --force-overwrite --csv "
         f"python benchmarks/microbench.py --backend {args.backend} --batch {args.batch} --heads {args.heads} "
         f"--seq-len {args.seq_len} --head-dim {args.head_dim} --block-size {args.block_size} "
         f"--iters {max(1, args.iters)} --warmup {max(1, args.warmup)} --repeats 1 "
         f"--device cuda --dtype {args.dtype} --json"
     )
+
+
+def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
+    """在 Colab/CUDA 上用 ncu profile 本 backend，把 measured_* 字段回填进 result。
+
+    做法：以子进程方式对 microbench 自身再跑一次（去掉 --profile-ncu 防止递归），
+    让 ncu 只 profile warmup 之后的少量 launch，用 --csv 直接拿到指标文本后解析。
+    任何失败都不会中断主流程，只在 result 里记录 profiler_error。
+    """
+
+    import subprocess
+
+    metrics_str = NCU_METRICS
+    cmd = [
+        args.ncu_bin,
+        "--metrics", metrics_str,
+        "--launch-skip", str(max(1, args.warmup)),
+        "--launch-count", str(args.ncu_launch_count),
+        "--target-processes", "all",
+        "--csv",
+        sys.executable, str(Path(__file__).resolve()),
+        "--backend", args.backend,
+        "--batch", str(args.batch), "--heads", str(args.heads),
+        "--seq-len", str(args.seq_len), "--head-dim", str(args.head_dim),
+        "--block-size", str(args.block_size),
+        "--iters", str(max(1, args.iters)), "--warmup", str(max(1, args.warmup)),
+        "--repeats", "1", "--device", "cuda", "--dtype", args.dtype,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.ncu_timeout)
+    except FileNotFoundError:
+        result["profiler_error"] = f"找不到 ncu 可执行文件：{args.ncu_bin}（Colab 上通常在 /usr/local/cuda/bin/ncu，或 apt-get install nsight-compute）"
+        return result
+    except subprocess.TimeoutExpired:
+        result["profiler_error"] = f"ncu profiling 超时（>{args.ncu_timeout}s），可减小 --iters 或 --ncu-launch-count"
+        return result
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-8:]
+        hint = "\n".join(tail)
+        if "ERR_NVGPUCTRPERM" in (proc.stderr or ""):
+            hint += "\n[权限问题] Colab 通常以 root 运行可直接 profile；本地需 sudo 或放开 NVreg_RestrictProfilingToAdminUsers。"
+        result["profiler_error"] = f"ncu 退出码 {proc.returncode}:\n{hint}"
+        return result
+
+    try:
+        parsed = parse_ncu_csv(proc.stdout)
+    except ValueError as exc:
+        result["profiler_error"] = f"解析 ncu CSV 失败：{exc}"
+        return result
+
+    result.update(parsed.as_backfill())
+    result["bandwidth_fields_are_estimates"] = False
+    return result
 
 
 def _latency_breakdown(
@@ -226,6 +292,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--raw-output", type=Path)
     parser.add_argument("--include-raw", action="store_true")
+    parser.add_argument("--profile-ncu", action="store_true",
+                        help="用 Nsight Compute 采集实测 DRAM/带宽/占用率并回填 measured_* 字段（需 CUDA + ncu）")
+    parser.add_argument("--ncu-bin", default="ncu", help="ncu 可执行文件路径（Colab: /usr/local/cuda/bin/ncu）")
+    parser.add_argument("--ncu-launch-count", type=int, default=NCU_LAUNCH_COUNT,
+                        help="ncu 只 profile warmup 之后的这么多次 launch")
+    parser.add_argument("--ncu-timeout", type=float, default=600.0, help="ncu 子进程超时秒数")
     return parser.parse_args()
 
 
@@ -356,6 +428,12 @@ def main() -> None:
     }
     if args.include_raw:
         result["raw_latency_ms"] = raw_latency_ms
+
+    if args.profile_ncu:
+        if device.type != "cuda":
+            result["profiler_error"] = "--profile-ncu 需要 CUDA 设备"
+        else:
+            result = _run_ncu_and_backfill(args, result)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
