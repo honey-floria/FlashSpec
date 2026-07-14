@@ -235,7 +235,10 @@ def _run_fused_dequant_attention_triton(
         lengths is not None,
         block_n,
         block_d,
-        num_warps=4,
+        # num_warps=8：grid 只有 batch*heads(=512) 个 program，A100 有 108 个 SM，
+        # 单 program 4 warps 时每 SM 仅 ~19 warps（occupancy ~25%）。提到 8 warps
+        # 可把 occupancy 拉到 ~59%，增加并发访存请求以更好地打满 HBM 带宽。
+        num_warps=8,
     )
 
     if not return_stats:

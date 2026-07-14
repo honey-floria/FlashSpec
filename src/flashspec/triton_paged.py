@@ -249,7 +249,9 @@ def _run_paged_quant_attention_triton(
         1.0 / math.sqrt(float(head_dim)),
         block_n,
         block_d,
-        num_warps=4,
+        # num_warps=8：与 fused kernel 同理，grid=batch*heads 太小导致 occupancy ~25%，
+        # 提到 8 warps 拉高 occupancy 与并发访存，详见 triton_fused.py 的说明。
+        num_warps=8,
     )
 
     if not return_stats:
