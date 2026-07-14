@@ -33,8 +33,24 @@ NCU_METRICS = (
     "sm__throughput.avg.pct_of_peak_sustained_elapsed,"
     "dram__throughput.avg.pct_of_peak_sustained_elapsed"
 )
-# 默认只 profile 这么多次 launch（warmup 之后），控制 ncu 开销。
+# 默认只 profile 这么多次 launch（匹配到的），控制 ncu 开销。
 NCU_LAUNCH_COUNT = 5
+
+# 各 backend 真正要 profile 的 kernel 名（正则）。用名字过滤而非 launch 序号，
+# 才能避开 backend 在计时前做的量化 elementwise kernel（Div/round/clamp/add），
+# 否则 ncu 会把稠密 KV 的量化访存当成 attention 访存，实测字节严重偏大。
+_NCU_KERNEL_REGEX = {
+    "triton_fused": "fused_dequant_attention_kernel",
+    "triton_paged": "paged_quant_attention_kernel",
+    "dense": "attention",  # reference_attention 的 SDPA/矩阵 kernel
+}
+
+
+def _ncu_kernel_regex(args: argparse.Namespace) -> str | None:
+    """返回该 backend 应 profile 的 kernel 名正则；未知则不过滤。"""
+    if getattr(args, "ncu_kernel_regex", ""):
+        return args.ncu_kernel_regex
+    return _NCU_KERNEL_REGEX.get(args.backend)
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -114,11 +130,13 @@ def _nsight_compute_command(args: argparse.Namespace) -> str:
 
     output = f"results/ncu_{args.backend}_b{args.batch}_h{args.heads}_s{args.seq_len}_d{args.head_dim}"
     # 只采集回填 measured_* 需要的 metric，不用 `--set full`：full 会把每个 kernel
-    # 重放几十次，在 Colab 上极慢甚至超时。`-s`/`-c` 跳过 warmup、只 profile 少量
-    # launch，进一步压缩开销。
+    # 重放几十次，在 Colab 上极慢甚至超时。用 --kernel-name 只 profile attention
+    # kernel（避开量化 elementwise kernel），--launch-count 再限制匹配次数。
+    regex = _ncu_kernel_regex(args)
+    kernel_filter = f'--kernel-name regex:"{regex}" ' if regex else ""
     return (
         f"ncu --metrics {NCU_METRICS} "
-        f"--launch-skip {max(1, args.warmup)} --launch-count {NCU_LAUNCH_COUNT} "
+        f"{kernel_filter}--launch-count {NCU_LAUNCH_COUNT} "
         f"--target-processes all --export {output} --force-overwrite --csv "
         f"python benchmarks/microbench.py --backend {args.backend} --batch {args.batch} --heads {args.heads} "
         f"--seq-len {args.seq_len} --head-dim {args.head_dim} --block-size {args.block_size} "
@@ -137,11 +155,11 @@ def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
 
     import subprocess
 
-    metrics_str = NCU_METRICS
-    cmd = [
-        args.ncu_bin,
-        "--metrics", metrics_str,
-        "--launch-skip", str(max(1, args.warmup)),
+    cmd = [args.ncu_bin, "--metrics", NCU_METRICS]
+    regex = _ncu_kernel_regex(args)
+    if regex:
+        cmd += ["--kernel-name", f"regex:{regex}"]
+    cmd += [
         "--launch-count", str(args.ncu_launch_count),
         "--target-processes", "all",
         "--csv",
@@ -176,6 +194,14 @@ def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
         result["profiler_error"] = f"解析 ncu CSV 失败：{exc}"
         return result
 
+    from flashspec.ncu_parse import suspicious_kernels
+
+    bad = suspicious_kernels(parsed.kernel_names)
+    if bad:
+        result["profiler_warning"] = (
+            "ncu 可能 profile 了非 attention kernel（量化/elementwise），实测字节可能偏大："
+            + ", ".join(sorted(set(bad))[:3])
+        )
     result.update(parsed.as_backfill())
     result["bandwidth_fields_are_estimates"] = False
     return result
@@ -296,7 +322,9 @@ def parse_args() -> argparse.Namespace:
                         help="用 Nsight Compute 采集实测 DRAM/带宽/占用率并回填 measured_* 字段（需 CUDA + ncu）")
     parser.add_argument("--ncu-bin", default="ncu", help="ncu 可执行文件路径（Colab: /usr/local/cuda/bin/ncu）")
     parser.add_argument("--ncu-launch-count", type=int, default=NCU_LAUNCH_COUNT,
-                        help="ncu 只 profile warmup 之后的这么多次 launch")
+                        help="ncu 只 profile 匹配到的这么多次 launch")
+    parser.add_argument("--ncu-kernel-regex", default="",
+                        help="覆盖按 backend 推断的 kernel 名正则；只 profile 匹配的 kernel")
     parser.add_argument("--ncu-timeout", type=float, default=600.0, help="ncu 子进程超时秒数")
     return parser.parse_args()
 

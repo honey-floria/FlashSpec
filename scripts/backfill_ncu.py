@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from flashspec.ncu_parse import parse_ncu_csv  # noqa: E402
+from flashspec.ncu_parse import parse_ncu_csv, suspicious_kernels  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,9 +53,17 @@ def main() -> None:
         csv_text = _csv_from_rep(args.ncu_rep, args.ncu_bin)
 
     metrics = parse_ncu_csv(csv_text)
+    bad = suspicious_kernels(metrics.kernel_names)
+    if bad:
+        print("[警告] 疑似 profile 了非 attention kernel（量化/elementwise），实测字节可能偏大：")
+        for n in sorted(set(bad))[:5]:
+            print(f"    - {n}")
+        print("  建议用 --kernel-name regex 只 profile attention kernel 后重新采集。")
     data = json.loads(args.json.read_text(encoding="utf-8"))
     data.update(metrics.as_backfill())
     data["bandwidth_fields_are_estimates"] = False
+    if bad:
+        data["profiler_warning"] = "ncu 可能 profile 了非 attention kernel：" + ", ".join(sorted(set(bad))[:3])
 
     est = data.get("estimated_effective_quant_kv_bandwidth_gbps")
     meas = metrics.achieved_bandwidth_gbps

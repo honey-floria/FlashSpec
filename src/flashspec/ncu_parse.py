@@ -102,6 +102,25 @@ class NcuMetrics:
         }
 
 
+def suspicious_kernels(names: list[str]) -> list[str]:
+    """挑出看起来不是 attention 的 kernel 名（量化/elementwise 预处理）。
+
+    这些名字出现说明 ncu 很可能 profile 错了对象（例如量化阶段的
+    Div/round/clamp/add），实测字节会偏大，需要用 --kernel-name 过滤重跑。
+    """
+    bad_markers = ("divfunctor", "round_kernel", "clamp", "cudafunctor_add",
+                   "vectorized_elementwise", "elementwise_kernel")
+    good_markers = ("attention", "attn", "flash")
+    flagged = []
+    for n in names:
+        low = n.lower()
+        if any(g in low for g in good_markers):
+            continue
+        if any(b in low for b in bad_markers):
+            flagged.append(n)
+    return flagged
+
+
 def _find_col(header: list[str], *candidates: str) -> int | None:
     """在 header 里按候选名（大小写不敏感）找列索引。"""
     lowered = [h.strip().lower() for h in header]
