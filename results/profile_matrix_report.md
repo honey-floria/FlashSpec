@@ -1,7 +1,7 @@
 # FlashSpec Profiling Matrix Report
 
-- matrix_dir: `results\profile_matrix`
-- source_dir: `results\ncu_source_attribution_export`
+- matrix_dir: `/content/drive/MyDrive/FlashSpecColab/results/profile_matrix`
+- source_dir: `/content/drive/MyDrive/FlashSpecColab/results/ncu_source_attribution_export`
 - matrix_points: `120`
 
 ## Top Latency Points
