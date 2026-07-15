@@ -1,0 +1,22 @@
+{
+  "backend": "dense",
+  "device": "cuda",
+  "device_name": "NVIDIA A100-SXM4-40GB",
+  "dtype": "float16",
+  "batch": 16,
+  "heads": 32,
+  "seq_len": 2048,
+  "head_dim": 128,
+  "block_size": 16,
+  "iters": 50,
+  "latency_ms": 2.294125340000619,
+  "tokens_per_second": 6974.335587085091,
+  "estimated_dense_kv_bytes": 536870912.0,
+  "estimated_quant_kv_bytes": 536870912.0,
+  "compression_ratio": 1.0,
+  "materializes_dense_kv": false,
+  "bandwidth_fields_are_estimates": true,
+  "effective_dense_kv_bandwidth_gbps": 234.01986920202677,
+  "effective_quant_kv_bandwidth_gbps": 234.01986920202677,
+  "output_checksum": -1.0567450523376465
+}
