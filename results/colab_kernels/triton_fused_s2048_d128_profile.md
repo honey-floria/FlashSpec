@@ -3,19 +3,31 @@
 - backend: `triton_fused`
 - device: `NVIDIA A100-SXM4-40GB`
 - shape: batch=16, heads=32, seq_len=2048, head_dim=128
+- kernel_knobs: block_n=`64`, num_splits=`4`, num_warps=`4`
+- env_knobs: FLASHSPEC_BLOCK_N=`not_collected`, FLASHSPEC_NUM_SPLITS=`not_collected`, FLASHSPEC_NUM_WARPS=`not_collected`
+- length_profile: pattern=`uniform`, min=`2048`, max=`2048`
+- paged_layout: `contiguous` seed=`0`
 - timing_method: `cuda_event`
-- latency_ms: `0.370156`
-- latency_p50_ms: `0.370156`
-- latency_p90_ms: `0.370854`
-- latency_p99_ms: `0.370988`
-- tokens_per_second: `43225.1`
+- latency_ms: `0.327936`
+- latency_p50_ms: `0.327936`
+- latency_p90_ms: `0.371175`
+- latency_p99_ms: `0.371439`
+- tokens_per_second: `48790`
 - materializes_dense_kv: `False`
 - raw_latency_samples: `20`
 
-## Nsight Compute Command
+## Nsight Compute Commands
+
+Fast metrics / JSON backfill:
 
 ```bash
-ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed --kernel-name regex:"fused_dequant_attention|combine_splits" --launch-count 5 --target-processes all --export results/ncu_triton_fused_b16_h32_s2048_d128 --force-overwrite --csv python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 1 --device cuda --dtype float16 --json
+ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,launch__registers_per_thread,sm__maximum_warps_per_active_cycle_pct --kernel-name regex:"fused_dequant_attention|combine_splits" --launch-count 5 --target-processes all --export results/ncu_triton_fused_b16_h32_s2048_d128 --force-overwrite --csv python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 1 --device cuda --dtype float16 --paged-layout contiguous --layout-seed 0 --length-pattern uniform --seed 0 --json
+```
+
+Source-line / instruction attribution:
+
+```bash
+ncu --section SourceCounters --section InstructionStats --section MemoryWorkloadAnalysis --section SchedulerStats --kernel-name regex:"fused_dequant_attention|combine_splits" --launch-count 1 --target-processes all --export results/ncu_source_triton_fused_b16_h32_s2048_d128 --force-overwrite python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 1 --device cuda --dtype float16 --paged-layout contiguous --layout-seed 0 --length-pattern uniform --seed 0 --json
 ```
 
 ## Latency Breakdown Map
@@ -32,10 +44,13 @@ ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,
 
 ## Measured Profiler Fields
 
-- measured_kernel_latency_ms: `0.370156`
-- measured_dram_bytes: `8.55102e+08`
-- measured_achieved_bandwidth_gbps: `775.403`
-- measured_occupancy_pct: `23.475`
-- measured_sm_utilization_pct: `46.3203`
+- measured_kernel_latency_ms: `0.327936`
+- measured_dram_bytes: `8.55176e+08`
+- measured_achieved_bandwidth_gbps: `775.358`
+- measured_occupancy_pct: `23.4666`
+- measured_sm_utilization_pct: `46.1606`
+- measured_dram_throughput_pct: `49.8616`
+- measured_registers_per_thread: `114`
+- measured_theoretical_occupancy_pct: `25`
 
-这些 measured profiler 字段需要用上面的 Nsight Compute 命令采集后回填；microbench 默认只负责生成可复现命令和 CUDA event latency。
+这些 measured profiler 字段需要用 fast metrics 命令采集后回填；source-line / instruction 命令用于进一步归因，不会自动折算成 JSON 字段。
