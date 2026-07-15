@@ -248,6 +248,54 @@ python scripts/profile_matrix.py --backend triton_paged \
 
 临时结论不变：`block_n=32` 不能作为默认；Split-K 值得保留并继续按 `num_splits` 矩阵找最优；Kernel 2 下一步必须跑 `paged_layout={contiguous,shuffled,interleaved}` 和 variable length 矩阵，否则无法判断 block_table locality 是否是主要损耗。
 
+**2026-07-15 small matrix + NCU 复跑结果（`results/profile_matrix/*/*manifest.csv`）**
+
+这次已经跑完 `MATRIX_PRESET=small, PROFILE_NCU=True`：
+
+- `triton_fused`: 16 个点，全部有 `measured_achieved_bandwidth_gbps / DRAM throughput / occupancy / registers`，无 `profiler_error`；
+- `triton_paged`: 16 个点，全部有 NCU fast metrics，无 `profiler_error`；
+- small 矩阵覆盖 `seq_len={2048,4096}, head_dim=128, block_n={64,128}, num_warps=4`；
+- fused 覆盖 `num_splits={auto,1,4,8}`；paged 覆盖 `length_pattern={uniform,descending}, paged_layout={contiguous,shuffled}`。
+
+每组 latency 最优点：
+
+| backend | seq_len | 最优配置 | latency_ms | measured BW | DRAM throughput | occupancy | regs/thread |
+|---|---:|---|---:|---:|---:|---:|---:|
+| triton_fused | 2048 | `block_n=128, num_splits=8` | 0.2619 | 908.5 GB/s | 58.4% | 18.3% | 168 |
+| triton_fused | 4096 | `block_n=128, num_splits=4` | 0.4865 | 929.9 GB/s | 59.8% | 17.9% | 168 |
+| triton_paged | 2048 | `block_n=128, descending, contiguous` | 0.2694 | 529.7 GB/s | 34.1% | 15.6% | 168 |
+| triton_paged | 4096 | `block_n=128, descending, contiguous` | 0.5275 | 522.0 GB/s | 33.6% | 15.6% | 168 |
+
+`block_n=128` 在 small 矩阵里明确优于 `block_n=64`：
+
+| backend | seq_len | best block_n=64 | best block_n=128 | block_n=128 speedup |
+|---|---:|---:|---:|---:|
+| triton_fused | 2048 | 0.3026 ms | 0.2619 ms | +15.5% |
+| triton_fused | 4096 | 0.5709 ms | 0.4865 ms | +17.3% |
+| triton_paged | 2048 | 0.3010 ms | 0.2694 ms | +11.7% |
+| triton_paged | 4096 | 0.5914 ms | 0.5275 ms | +12.1% |
+
+这进一步强化实验 4 的结论：当前瓶颈不是“occupancy 数字不够高”。`block_n=128` 寄存器更高、occupancy 更低，但 DRAM throughput 和 latency 更好；应优先保留更大的 scan tile，提高内存效率和减少循环/地址开销。
+
+Split-K 结论：
+
+- `s2048/d128`: 最优是 `num_splits=8`，`0.2619 ms`；`split=4` 为 `0.2881 ms`，`auto` 为 `0.3103 ms`。
+- `s4096/d128`: 最优是 `num_splits=4`，`0.4865 ms`；`auto` 为 `0.4872 ms`，几乎相同；`split=8` 为 `0.4948 ms`。
+- 因此 Split-K 最优值是 shape-dependent。默认策略可以考虑：`seq_len<=2048` 偏向 8，`seq_len>=4096` 偏向 4 或 auto；正式改默认前还需要 full matrix 或更多 shape 复核。
+
+Paged locality / variable length 观察：
+
+- `descending` 的 event latency 更低，主要因为有效 token 数变少；这不是 uniform shape 的直接优化收益，后续比较必须按 effective token/bytes 一起看。
+- `contiguous` 在 descending 下明显优于 shuffled，尤其 s2048: `0.2694 ms` vs `0.3361 ms`，说明 block_table locality 对 variable length/paged 场景有实际影响。
+- uniform 下 s2048 的 shuffled 反而快于 contiguous（`0.3028 ms` vs `0.3550 ms`），这可能是单次测量噪声、物理 block 分布副作用，或 cache/set 冲突差异；需要增加 repeats 或加入 `interleaved` 后再定论。
+
+下一步优化方向：
+
+1. 跑 `full + PROFILE_NCU=False`，快速补上 `num_warps=8`、`block_n=32`、paged `interleaved` 的 latency 排名。
+2. 对 full latency 前 3-5 个候选再开 `PROFILE_NCU=True`，避免全矩阵 NCU 过慢。
+3. fused 默认候选优先测试 `block_n=128`，Split-K 根据 `seq_len` 分段选择。
+4. paged 继续重点看 block_table locality：`contiguous/shuffled/interleaved` + source-line，确认 long scoreboard 或地址计算是否是主要损耗。
+
 ---
 
 ## 附:已修复的基础设施 bug
