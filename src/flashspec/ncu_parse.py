@@ -42,6 +42,8 @@ _DURATION = "gpu__time_duration.sum"
 _OCCUPANCY = "sm__warps_active.avg.pct_of_peak_sustained_active"
 _SM_THROUGHPUT = "sm__throughput.avg.pct_of_peak_sustained_elapsed"
 _DRAM_THROUGHPUT = "dram__throughput.avg.pct_of_peak_sustained_elapsed"
+_REGISTERS = "launch__registers_per_thread"
+_MAX_OCCUPANCY = "sm__maximum_warps_per_active_cycle_pct"
 
 
 def _to_float(raw: str) -> float | None:
@@ -72,6 +74,8 @@ class _Kernel:
     occupancy_pct: float | None = None
     sm_pct: float | None = None
     dram_pct: float | None = None
+    registers_per_thread: float | None = None
+    theoretical_occupancy_pct: float | None = None
 
 
 @dataclass
@@ -86,6 +90,8 @@ class NcuMetrics:
     dram_throughput_pct: float | None
     kernel_count: int
     kernel_names: list[str] = field(default_factory=list)
+    registers_per_thread: float | None = None
+    theoretical_occupancy_pct: float | None = None
 
     def as_backfill(self) -> dict[str, object]:
         """转成 microbench JSON 里的 measured_* 字段字典。"""
@@ -98,6 +104,8 @@ class NcuMetrics:
             "measured_ncu_kernel_duration_ms": self.duration_ns / 1e6,
             "measured_ncu_kernel_count": self.kernel_count,
             "measured_ncu_kernel_names": self.kernel_names,
+            "measured_registers_per_thread": self.registers_per_thread,
+            "measured_theoretical_occupancy_pct": self.theoretical_occupancy_pct,
             "profiler_metrics_source": "nsight_compute_csv",
         }
 
@@ -184,6 +192,10 @@ def parse_ncu_csv(text: str) -> NcuMetrics:
             k.sm_pct = value
         elif metric == _DRAM_THROUGHPUT:
             k.dram_pct = value
+        elif metric == _REGISTERS:
+            k.registers_per_thread = value
+        elif metric == _MAX_OCCUPANCY:
+            k.theoretical_occupancy_pct = value
 
     if not kernels:
         raise ValueError("ncu CSV 未解析到任何 kernel 指标行")
@@ -216,4 +228,19 @@ def _aggregate(kernels: list[_Kernel]) -> NcuMetrics:
         dram_throughput_pct=_weighted([(k.dram_pct, k.duration_ns) for k in kernels]),
         kernel_count=len(kernels),
         kernel_names=[k.name for k in kernels if k.name],
+        # 寄存器/理论占用率取耗时最长的 kernel（主 kernel），避免被 combine 小 kernel 稀释。
+        registers_per_thread=_dominant(kernels, "registers_per_thread"),
+        theoretical_occupancy_pct=_dominant(kernels, "theoretical_occupancy_pct"),
     )
+
+
+def _dominant(kernels: list[_Kernel], attr: str) -> float | None:
+    """取耗时最长且该字段非空的 kernel 的值（代表主 kernel 的资源特征）。"""
+    best = None
+    for k in kernels:
+        v = getattr(k, attr)
+        if v is None:
+            continue
+        if best is None or k.duration_ns > best[1]:
+            best = (v, k.duration_ns)
+    return best[0] if best else None

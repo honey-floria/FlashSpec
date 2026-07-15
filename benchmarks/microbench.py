@@ -31,7 +31,11 @@ NCU_METRICS = (
     "dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,"
     "sm__warps_active.avg.pct_of_peak_sustained_active,"
     "sm__throughput.avg.pct_of_peak_sustained_elapsed,"
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed"
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed,"
+    # 占用率限制诊断：每线程寄存器数 + 理论占用率上限（越低说明越受资源限制）。
+    # 用于判定 occupancy 卡在 ~25% 是否因寄存器压力（而非 block 数不足）。
+    "launch__registers_per_thread,"
+    "sm__maximum_warps_per_active_cycle_pct"
 )
 # 默认只 profile 这么多次 launch（匹配到的），控制 ncu 开销。
 NCU_LAUNCH_COUNT = 5
