@@ -40,8 +40,11 @@ NCU_LAUNCH_COUNT = 5
 # 才能避开 backend 在计时前做的量化 elementwise kernel（Div/round/clamp/add），
 # 否则 ncu 会把稠密 KV 的量化访存当成 attention 访存，实测字节严重偏大。
 _NCU_KERNEL_REGEX = {
-    "triton_fused": "fused_dequant_attention_kernel",
-    "triton_paged": "paged_quant_attention_kernel",
+    # Split-K 后 fused 有 3 个 kernel：单 kernel(_fused_dequant_attention_kernel)、
+    # split kernel(_fused_dequant_attention_split_kernel) 和 combine(_combine_splits_kernel)。
+    # 正则要覆盖全部三个，否则 Split-K 开启时 ncu 抓不到 kernel。
+    "triton_fused": "fused_dequant_attention|combine_splits",
+    "triton_paged": "paged_quant_attention_kernel|combine_splits",
     "dense": "attention",  # reference_attention 的 SDPA/矩阵 kernel
 }
 

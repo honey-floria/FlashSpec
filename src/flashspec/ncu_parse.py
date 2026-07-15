@@ -110,7 +110,7 @@ def suspicious_kernels(names: list[str]) -> list[str]:
     """
     bad_markers = ("divfunctor", "round_kernel", "clamp", "cudafunctor_add",
                    "vectorized_elementwise", "elementwise_kernel")
-    good_markers = ("attention", "attn", "flash")
+    good_markers = ("attention", "attn", "flash", "combine_splits")
     flagged = []
     for n in names:
         low = n.lower()
