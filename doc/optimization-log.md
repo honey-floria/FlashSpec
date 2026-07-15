@@ -117,6 +117,31 @@ split:    114 reg × 128 = 14592 → 65536/14592 = 4.49 → 4 block × 4 = 16 wa
 
 ---
 
+## 实验 4: 降寄存器 — block_n 64→32 🔬 进行中(待 Colab 数据)
+
+**动机**
+实验 3 确认占用率天花板被寄存器压死(96 reg → theoOcc 31.25%)。唯一能抬天花板的旋钮是降每线程寄存器数。
+`k_deq`/`v_deq` 临时 tile 是 `[block_n, block_d]`,寄存器占用与 block_n 成正比 → 调小 block_n 是最直接的降寄存器手段。
+
+**做法**
+- `triton_fused.py` 新增 `_resolve_block_n()`:环境变量 `FLASHSPEC_BLOCK_N` 覆盖(默认 64,可选 16/32/128,非法回退 64)。
+- `block_n` 回填进 stats,供 A/B 表显示。
+- run.ipynb 加实验 4 cell:固定 `FLASHSPEC_NUM_SPLITS=1`(单 kernel,和实验 3 基线对齐),只变 block_n∈{64,32},
+  对比 reg / theoOcc / occ / dram% / bw / latency。
+
+**判读方法(待填实测)**
+- block_n=32 应减小 tile → reg 下降。若 reg 压到 ~64 → theoOcc 应升到 ~50%(65536/(64×128)=8 block/SM)。
+- 再看延迟:内存瓶颈型 kernel,占用率升 → 并发访存增多 → 带宽升 → 期望延迟降。
+- 代价:block_n 减半 → 循环轮数翻倍,若 reg 没降够或访存效率下降,可能反而变慢。
+
+**结果**: 待补(Colab A/B)
+
+**原因分析**: 待补
+
+**结论**: 待补
+
+---
+
 ## 附:已修复的基础设施 bug
 
 - **ncu kernel 名正则漏匹配 Split-K kernel**(`microbench.py`):原正则 `fused_dequant_attention_kernel`

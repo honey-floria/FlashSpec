@@ -369,6 +369,29 @@ def _compute_num_splits(seq_len: int, block_n: int) -> int:
     return max(1, min(s, _S_MAX))
 
 
+def _resolve_block_n() -> int:
+    """每个 program 每轮扫描的 token 数。默认 64。
+
+    实验 4（降寄存器）A/B 开关：k_deq/v_deq 临时 tile 是 [block_n, block_d]，
+    寄存器占用与 block_n 成正比。调小 block_n 可降低 registers_per_thread、
+    抬高占用率天花板，代价是循环轮数增加。用环境变量隔离该变量：
+    - FLASHSPEC_BLOCK_N=32  每轮扫 32 token（更少寄存器）；
+    - FLASHSPEC_BLOCK_N=64  默认；
+    - 未设置或非法值        用默认 64。
+    限制为 [16, 128] 内的 2 的幂，避免病态 tile 尺寸。
+    """
+
+    override = os.environ.get("FLASHSPEC_BLOCK_N")
+    if override is not None:
+        try:
+            v = int(override)
+        except ValueError:
+            v = 0
+        if v in (16, 32, 64, 128):
+            return v
+    return 64
+
+
 def _run_fused_dequant_attention_triton(
     q: torch.Tensor,
     k_quant: QuantizedTensor,
@@ -401,9 +424,9 @@ def _run_fused_dequant_attention_triton(
     block_size = int(k_quant.block_size)
     block_d = next_power_of_2(int(head_dim))
 
-    # block_n 是每个 program 每轮扫描的 token 数。64 在 head_dim=64/128 下
-    # 能控制单个 program 的寄存器/临时矩阵规模，同时覆盖长 seq_len 的循环扫描。
-    block_n = 64
+    # block_n 是每个 program 每轮扫描的 token 数（实验 4：可用 FLASHSPEC_BLOCK_N 覆盖）。
+    # tile [block_n, block_d] 越小，registers_per_thread 越低、占用率天花板越高。
+    block_n = _resolve_block_n()
     out = torch.empty_like(q_contig)
     sm_scale = 1.0 / math.sqrt(float(head_dim))
 
@@ -494,6 +517,8 @@ def _run_fused_dequant_attention_triton(
         "materializes_dense_kv": 0.0,
         # Split-K 段数：1 表示走单 kernel 快路径，>1 表示 split+combine 路径。
         "num_splits": float(num_splits),
+        # 每轮扫描 token 数（实验 4 降寄存器 A/B 变量）。
+        "block_n": float(block_n),
     }
     return out, stats
 
