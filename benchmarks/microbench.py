@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -446,6 +447,11 @@ def main() -> None:
         # Split-K 段数：仅 triton_fused 会给出。None=该 backend 无此概念，
         # 1=走单 kernel 快路径，>1=走 split+combine 路径。用于验证 Split-K 是否生效。
         "num_splits": stats.get("num_splits"),
+        # kernel tile / 环境覆盖：后续优化实验必须能从 JSON 反查真实运行配置。
+        # 目前 block_n 由 Triton backend stats 回填；portable backend 无此概念。
+        "block_n": stats.get("block_n"),
+        "env_flashspec_num_splits": os.environ.get("FLASHSPEC_NUM_SPLITS"),
+        "env_flashspec_block_n": os.environ.get("FLASHSPEC_BLOCK_N"),
         "bandwidth_fields_are_estimates": True,
         "estimated_effective_dense_kv_bandwidth_gbps": dense_bandwidth,
         "estimated_effective_quant_kv_bandwidth_gbps": quant_bandwidth,
@@ -459,6 +465,12 @@ def main() -> None:
         "measured_achieved_bandwidth_gbps": None,
         "measured_occupancy_pct": None,
         "measured_sm_utilization_pct": None,
+        "measured_dram_throughput_pct": None,
+        "measured_registers_per_thread": None,
+        "measured_theoretical_occupancy_pct": None,
+        "measured_ncu_kernel_duration_ms": None,
+        "measured_ncu_kernel_count": None,
+        "measured_ncu_kernel_names": None,
         "profiler_metrics_source": "nsight_compute_required_for_dram_occupancy_sm",
         "nsight_compute_command": _nsight_compute_command(args),
         "latency_breakdown": _latency_breakdown(args, stats, latency_ms, timing_method),

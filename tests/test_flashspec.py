@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -171,6 +174,51 @@ class FlashSpecTest(unittest.TestCase):
         expected = reference_attention(q, kd, vd, lengths=cache.lengths)
         actual = paged_quant_attention(q, cache)
         torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
+
+    def test_microbench_json_schema_includes_experiment_knobs(self) -> None:
+        env = os.environ.copy()
+        env.pop("FLASHSPEC_NUM_SPLITS", None)
+        env.pop("FLASHSPEC_BLOCK_N", None)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "benchmarks" / "microbench.py"),
+                "--backend", "dense",
+                "--batch", "1",
+                "--heads", "1",
+                "--seq-len", "4",
+                "--head-dim", "8",
+                "--iters", "1",
+                "--warmup", "0",
+                "--repeats", "1",
+                "--device", "cpu",
+                "--dtype", "float32",
+                "--json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        data = json.loads(proc.stdout)
+        for key in (
+            "backend",
+            "seq_len",
+            "head_dim",
+            "block_size",
+            "num_splits",
+            "block_n",
+            "env_flashspec_num_splits",
+            "env_flashspec_block_n",
+            "bandwidth_fields_are_estimates",
+            "measured_registers_per_thread",
+            "measured_theoretical_occupancy_pct",
+            "materializes_dense_kv",
+        ):
+            self.assertIn(key, data)
+        self.assertIsNone(data["block_n"])
+        self.assertIsNone(data["env_flashspec_num_splits"])
+        self.assertIsNone(data["env_flashspec_block_n"])
 
     @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
     def test_triton_paged_attention_after_append_matches_reconstructed_cache_on_cuda(self) -> None:

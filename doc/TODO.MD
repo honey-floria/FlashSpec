@@ -139,19 +139,23 @@
 - CUDA 测试在无 GPU 环境自动 skip；
 - Triton kernel 测试与 portable reference 共用 case。
 
-### 8. 增加 benchmark schema 测试
+### 8. [~] 增加 benchmark schema 测试
 
 benchmark 结果未来会用于画图和对比，需要稳定字段：
 
-- microbench JSON schema；
+- microbench JSON schema（已加入 CPU smoke test，覆盖 `block_n`、`env_flashspec_*`、`measured_registers_per_thread` 等关键字段）；
 - sweep CSV fieldnames；
 - e2e serving JSON schema；
 - `materializes_dense_kv`、`bandwidth_fields_are_estimates` 等边界字段必须存在。
 
 验收标准：
 
-- CI 中运行小规模 benchmark smoke test；
-- schema 变更需要同步 README 和 doc。
+- [x] CPU 单测中运行小规模 `microbench.py --backend dense --json` smoke test；
+- [x] microbench JSON 顶层保留实验旋钮：`num_splits`、`block_n`、`env_flashspec_num_splits`、`env_flashspec_block_n`；
+- [x] `scripts/analyze_results.py` 的 `summary.csv` 导出 ncu 诊断列，便于复核实验；
+- [ ] sweep CSV fieldnames schema 测试；
+- [ ] e2e serving JSON schema 测试；
+- [ ] CI 中固定运行小规模 benchmark smoke test。
 
 ## P2：量化策略和数值质量
 

@@ -96,13 +96,23 @@ def plot_triton_scaling(rows: list[dict], out: Path) -> None:
 
 def write_summary_csv(rows: list[dict], out: Path) -> None:
     """把关键指标导出成 CSV 便于二次分析。"""
-    cols = ["_file", "backend", "seq_len", "head_dim", "latency_ms",
-            "latency_std_ms", "tokens_per_second", "compression_ratio",
-            "effective_quant_kv_bandwidth_gbps", "materializes_dense_kv"]
+    cols = [
+        "_file", "backend", "seq_len", "head_dim", "block_size", "block_n",
+        "num_splits", "env_flashspec_num_splits", "env_flashspec_block_n",
+        "latency_ms", "latency_std_ms", "tokens_per_second",
+        "compression_ratio", "effective_quant_kv_bandwidth_gbps",
+        "measured_achieved_bandwidth_gbps", "measured_dram_throughput_pct",
+        "measured_occupancy_pct", "measured_registers_per_thread",
+        "measured_theoretical_occupancy_pct", "materializes_dense_kv",
+    ]
     lines = [",".join(cols)]
     for r in sorted(rows, key=lambda r: (r.get("backend", ""), r.get("seq_len", 0),
                                          r.get("head_dim", 0))):
-        lines.append(",".join(str(r.get(c, "")) for c in cols))
+        values = []
+        for c in cols:
+            v = r.get(c, "")
+            values.append("" if v is None else str(v))
+        lines.append(",".join(values))
     (out / "summary.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

@@ -266,6 +266,7 @@ def _run_paged_quant_attention_triton(
         "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
         "physical_blocks": float(cache.block_table.ge(0).sum().item()),
         "materializes_dense_kv": 0.0,
+        "block_n": float(block_n),
     }
     return out, stats
 
