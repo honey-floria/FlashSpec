@@ -102,6 +102,26 @@ class FlashSpecTest(unittest.TestCase):
         self.assertLess(float((k - kd).abs().max().item()), 0.03)
         self.assertLess(float((v - vd).abs().max().item()), 0.03)
 
+    def test_paged_cache_profile_layouts_preserve_logical_kv(self) -> None:
+        k = torch.randn(3, 2, 17, 8)
+        v = torch.randn(3, 2, 17, 8)
+        lengths = torch.tensor([17, 11, 5], dtype=torch.int64)
+        for layout in ("shuffled", "interleaved"):
+            cache = PagedKVCache.from_dense(
+                k,
+                v,
+                block_size=4,
+                lengths=lengths,
+                block_table_pattern=layout,
+                layout_seed=13,
+            )
+            kd, vd = cache.to_dense()
+            self.assertEqual(tuple(cache.lengths.tolist()), tuple(lengths.tolist()))
+            self.assertEqual(tuple(kd.shape), tuple(k.shape))
+            self.assertEqual(tuple(vd.shape), tuple(v.shape))
+            self.assertLess(float((k - kd).abs().max().item()), 0.03)
+            self.assertLess(float((v - vd).abs().max().item()), 0.03)
+
     def test_paged_attention_matches_dense_quant_attention(self) -> None:
         q = torch.randn(2, 2, 8)
         k = torch.randn(2, 2, 17, 8)
@@ -179,6 +199,7 @@ class FlashSpecTest(unittest.TestCase):
         env = os.environ.copy()
         env.pop("FLASHSPEC_NUM_SPLITS", None)
         env.pop("FLASHSPEC_BLOCK_N", None)
+        env.pop("FLASHSPEC_NUM_WARPS", None)
         proc = subprocess.run(
             [
                 sys.executable,
@@ -210,15 +231,30 @@ class FlashSpecTest(unittest.TestCase):
             "block_n",
             "env_flashspec_num_splits",
             "env_flashspec_block_n",
+            "env_flashspec_num_warps",
+            "num_warps",
+            "length_pattern",
+            "effective_lengths",
+            "effective_min_seq_len",
+            "effective_max_seq_len",
+            "paged_layout",
+            "paged_layout_seed",
             "bandwidth_fields_are_estimates",
             "measured_registers_per_thread",
             "measured_theoretical_occupancy_pct",
+            "nsight_compute_source_command",
+            "nsight_compute_commands",
             "materializes_dense_kv",
         ):
             self.assertIn(key, data)
         self.assertIsNone(data["block_n"])
+        self.assertIsNone(data["num_warps"])
         self.assertIsNone(data["env_flashspec_num_splits"])
         self.assertIsNone(data["env_flashspec_block_n"])
+        self.assertIsNone(data["env_flashspec_num_warps"])
+        self.assertEqual(data["length_pattern"], "uniform")
+        self.assertEqual(data["effective_lengths"], [4])
+        self.assertEqual(data["paged_layout"], "contiguous")
 
     @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
     def test_triton_paged_attention_after_append_matches_reconstructed_cache_on_cuda(self) -> None:

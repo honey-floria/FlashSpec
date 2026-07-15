@@ -97,8 +97,10 @@ def plot_triton_scaling(rows: list[dict], out: Path) -> None:
 def write_summary_csv(rows: list[dict], out: Path) -> None:
     """把关键指标导出成 CSV 便于二次分析。"""
     cols = [
-        "_file", "backend", "seq_len", "head_dim", "block_size", "block_n",
-        "num_splits", "env_flashspec_num_splits", "env_flashspec_block_n",
+        "_file", "backend", "seq_len", "head_dim", "block_size", "block_n", "num_warps",
+        "num_splits", "env_flashspec_num_splits", "env_flashspec_block_n", "env_flashspec_num_warps",
+        "length_pattern", "effective_min_seq_len", "effective_max_seq_len",
+        "paged_layout", "paged_layout_seed",
         "latency_ms", "latency_std_ms", "tokens_per_second",
         "compression_ratio", "effective_quant_kv_bandwidth_gbps",
         "measured_achieved_bandwidth_gbps", "measured_dram_throughput_pct",

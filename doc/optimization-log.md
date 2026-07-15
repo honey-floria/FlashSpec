@@ -158,6 +158,76 @@ split:    114 reg × 128 = 14592 → 65536/14592 = 4.49 → 4 block × 4 = 16 wa
 
 ---
 
+## 实验 5: Kernel profiling 矩阵与 source-line 归因基础设施 🧪 待 A100 复跑
+
+**动机**
+实验 4 证明“occupancy 变高”不能直接等价为“性能变好”。下一步需要从单点 A/B 变成矩阵化 profiling：
+
+- Kernel 1: 同时 sweep `num_splits / block_n / num_warps`，判断 Split-K、tile 和 warp 之间的交互；
+- Kernel 2: 单独看 `block_n / num_warps / block_table locality / variable lengths`，不能套用 Kernel 1 的结论；
+- Nsight Compute 不只看总带宽/occupancy，还要能进入 source-line / instruction / memory workload 归因。
+
+**做法**
+
+- `triton_fused.py` 新增 `FLASHSPEC_NUM_WARPS` 覆盖，stats 回填 `num_warps`。
+- `triton_paged.py` 新增 `FLASHSPEC_BLOCK_N` 和 `FLASHSPEC_NUM_WARPS` 覆盖，Kernel 2 也能做 tile/warp sweep。
+- `PagedKVCache.from_dense()` 新增 profiling layout:
+  - `contiguous`: 原始连续物理 block；
+  - `shuffled`: 随机打乱 physical block，保持逻辑 KV 不变；
+  - `interleaved`: 按 logical block 跨 batch 交错，观察 locality 变化。
+- `microbench.py` 新增:
+  - `--length-pattern {uniform,descending,bimodal,random}` 和 `--lengths`；
+  - `--paged-layout` / `--layout-seed`；
+  - JSON 字段 `num_warps`、`env_flashspec_num_warps`、`length_pattern`、`effective_min/max_seq_len`、`paged_layout`；
+  - `nsight_compute_source_command`，用于 source-line / instruction 归因。
+- 新增 `scripts/profile_matrix.py`：
+  - Kernel 1 矩阵：`seq_len × head_dim × block_n × num_warps × num_splits × length_pattern`；
+  - Kernel 2 矩阵：`seq_len × head_dim × block_n × num_warps × length_pattern × paged_layout`；
+  - 可选 `--profile-ncu` 直接回填 fast metrics，并输出 manifest CSV。
+
+**推荐命令**
+
+Kernel 1 先跑小矩阵确认方向：
+
+```bash
+python scripts/profile_matrix.py --backend triton_fused \
+  --seq-lens 2048,4096 --head-dims 128 \
+  --block-ns 32,64,128 --num-warps 4,8 \
+  --num-splits auto,1,4,8 \
+  --length-patterns uniform \
+  --profile-ncu --output-dir results/profile_matrix/fused
+```
+
+Kernel 2 单独看 locality 和 variable length：
+
+```bash
+python scripts/profile_matrix.py --backend triton_paged \
+  --seq-lens 2048,4096 --head-dims 128 \
+  --block-ns 32,64,128 --num-warps 4,8 \
+  --length-patterns uniform,descending \
+  --paged-layouts contiguous,shuffled,interleaved \
+  --profile-ncu --output-dir results/profile_matrix/paged
+```
+
+单点 source-line / instruction 归因使用 microbench JSON 里的 `nsight_compute_source_command`。它会采集
+`SourceCounters / InstructionStats / MemoryWorkloadAnalysis / SchedulerStats`，用于回答：
+
+- dequant 转换和 scale/zero 计算是否贡献大量指令；
+- QK/PV 是否主要是普通 scalar/vector 指令，而不是 tensor-core 路径；
+- paged load 是否因为 block_table 间接寻址产生 long scoreboard stall；
+- `block_n=32` 变慢到底是访存效率下降、循环/地址开销增加，还是 instruction mix 变差。
+
+**当前结论**
+
+这是 profiling 基础设施改造，**还不是性能结论**。下一步必须在 A100 上跑矩阵并更新本日志：
+
+- 先比较 `block_n=64` 与 `block_n=128`，验证是否能在不显著增寄存器的情况下提升 DRAM throughput；
+- 对 Kernel 1 看 `num_splits` 与 `num_warps` 是否存在 shape-dependent 最优点；
+- 对 Kernel 2 看 `shuffled/interleaved` 是否明显拉高 latency 或 long scoreboard stall；
+- 如果 source-line 显示地址计算/反量化指令占比过高，再进入代码级寄存器生命周期和地址张量优化。
+
+---
+
 ## 附:已修复的基础设施 bug
 
 - **ncu kernel 名正则漏匹配 Split-K kernel**(`microbench.py`):原正则 `fused_dequant_attention_kernel`

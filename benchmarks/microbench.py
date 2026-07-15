@@ -38,6 +38,7 @@ NCU_METRICS = (
     "launch__registers_per_thread,"
     "sm__maximum_warps_per_active_cycle_pct"
 )
+NCU_SOURCE_SECTIONS = ("SourceCounters", "InstructionStats", "MemoryWorkloadAnalysis", "SchedulerStats")
 # 默认只 profile 这么多次 launch（匹配到的），控制 ncu 开销。
 NCU_LAUNCH_COUNT = 5
 
@@ -78,6 +79,53 @@ def _percentile(values: list[float], percentile: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _comma_ints(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _resolve_lengths(args: argparse.Namespace, device: torch.device) -> torch.Tensor:
+    """生成本次 benchmark 的每 request 有效长度。
+
+    默认全是 seq_len。profiling Kernel 2 时可用 --length-pattern 或 --lengths
+    生成 variable length case，观察 mask 分支和 block_table 扫描范围的影响。
+    """
+
+    if args.lengths:
+        values = _comma_ints(args.lengths)
+        if len(values) == 1:
+            values = values * args.batch
+        if len(values) != args.batch:
+            raise ValueError("--lengths 必须给 1 个值或 batch 个逗号分隔值")
+    else:
+        pattern = args.length_pattern
+        if pattern == "uniform":
+            values = [args.seq_len] * args.batch
+        elif pattern == "descending":
+            lo = max(1, args.seq_len // 4)
+            if args.batch == 1:
+                values = [args.seq_len]
+            else:
+                values = [
+                    int(round(args.seq_len - (args.seq_len - lo) * i / (args.batch - 1)))
+                    for i in range(args.batch)
+                ]
+        elif pattern == "bimodal":
+            short = max(1, args.seq_len // 4)
+            split = args.batch // 2
+            values = [args.seq_len] * split + [short] * (args.batch - split)
+        elif pattern == "random":
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(args.seed))
+            lo = max(1, args.seq_len // 4)
+            values = torch.randint(lo, args.seq_len + 1, (args.batch,), generator=generator).tolist()
+        else:
+            raise ValueError("--length-pattern 必须是 uniform、descending、bimodal 或 random")
+
+    if any(v < 1 or v > args.seq_len for v in values):
+        raise ValueError("effective lengths 必须位于 [1, seq_len]")
+    return torch.tensor(values, dtype=torch.int64, device=device)
 
 
 def _measure_latency_ms(
@@ -129,6 +177,42 @@ def _measure_latency_ms(
     return out, raw_latency_ms, timing_method
 
 
+def _microbench_command_args(args: argparse.Namespace) -> list[str]:
+    """返回 ncu 子进程要复现当前 benchmark 配置的参数。"""
+
+    cmd = [
+        "python", "benchmarks/microbench.py",
+        "--backend", args.backend,
+        "--batch", str(args.batch),
+        "--heads", str(args.heads),
+        "--seq-len", str(args.seq_len),
+        "--head-dim", str(args.head_dim),
+        "--block-size", str(args.block_size),
+        "--iters", str(max(1, args.iters)),
+        "--warmup", str(max(1, args.warmup)),
+        "--repeats", "1",
+        "--device", "cuda",
+        "--dtype", args.dtype,
+        "--paged-layout", args.paged_layout,
+        "--layout-seed", str(args.layout_seed),
+        "--length-pattern", args.length_pattern,
+        "--seed", str(args.seed),
+        "--json",
+    ]
+    if args.lengths:
+        cmd += ["--lengths", args.lengths]
+    return cmd
+
+
+def _env_command_prefix() -> str:
+    parts = []
+    for key in ("FLASHSPEC_NUM_SPLITS", "FLASHSPEC_BLOCK_N", "FLASHSPEC_NUM_WARPS"):
+        value = os.environ.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return (" ".join(parts) + " ") if parts else ""
+
+
 def _nsight_compute_command(args: argparse.Namespace) -> str:
     """生成可复制的 Nsight Compute profiling 命令模板。
 
@@ -142,14 +226,27 @@ def _nsight_compute_command(args: argparse.Namespace) -> str:
     # kernel（避开量化 elementwise kernel），--launch-count 再限制匹配次数。
     regex = _ncu_kernel_regex(args)
     kernel_filter = f'--kernel-name regex:"{regex}" ' if regex else ""
+    bench = " ".join(_microbench_command_args(args))
     return (
-        f"ncu --metrics {NCU_METRICS} "
+        f"{_env_command_prefix()}ncu --metrics {NCU_METRICS} "
         f"{kernel_filter}--launch-count {NCU_LAUNCH_COUNT} "
         f"--target-processes all --export {output} --force-overwrite --csv "
-        f"python benchmarks/microbench.py --backend {args.backend} --batch {args.batch} --heads {args.heads} "
-        f"--seq-len {args.seq_len} --head-dim {args.head_dim} --block-size {args.block_size} "
-        f"--iters {max(1, args.iters)} --warmup {max(1, args.warmup)} --repeats 1 "
-        f"--device cuda --dtype {args.dtype} --json"
+        f"{bench}"
+    )
+
+
+def _nsight_compute_source_command(args: argparse.Namespace) -> str:
+    """生成 source-line / instruction 归因用的 Nsight Compute 命令模板。"""
+
+    output = f"results/ncu_source_{args.backend}_b{args.batch}_h{args.heads}_s{args.seq_len}_d{args.head_dim}"
+    regex = _ncu_kernel_regex(args)
+    kernel_filter = f'--kernel-name regex:"{regex}" ' if regex else ""
+    sections = " ".join(f"--section {section}" for section in NCU_SOURCE_SECTIONS)
+    bench = " ".join(_microbench_command_args(args))
+    return (
+        f"{_env_command_prefix()}ncu {sections} {kernel_filter}--launch-count 1 "
+        f"--target-processes all --export {output} --force-overwrite "
+        f"{bench}"
     )
 
 
@@ -176,9 +273,15 @@ def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
         "--batch", str(args.batch), "--heads", str(args.heads),
         "--seq-len", str(args.seq_len), "--head-dim", str(args.head_dim),
         "--block-size", str(args.block_size),
+        "--paged-layout", args.paged_layout,
+        "--layout-seed", str(args.layout_seed),
+        "--length-pattern", args.length_pattern,
+        "--seed", str(args.seed),
         "--iters", str(max(1, args.iters)), "--warmup", str(max(1, args.warmup)),
         "--repeats", "1", "--device", "cuda", "--dtype", args.dtype,
     ]
+    if args.lengths:
+        cmd += ["--lengths", args.lengths]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.ncu_timeout)
     except FileNotFoundError:
@@ -316,6 +419,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lengths", default="",
+                        help="逗号分隔的每 request 有效长度；给 1 个值时广播到 batch")
+    parser.add_argument("--length-pattern", default="uniform",
+                        choices=["uniform", "descending", "bimodal", "random"],
+                        help="未显式给 --lengths 时生成 effective lengths 的模式")
+    parser.add_argument("--paged-layout", default="contiguous",
+                        choices=["contiguous", "shuffled", "interleaved"],
+                        help="PagedKVCache physical block 布局，用于 Kernel 2 locality profiling")
+    parser.add_argument("--layout-seed", type=int, default=0, help="shuffled paged layout 的随机种子")
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
@@ -344,14 +457,15 @@ def main() -> None:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
     generator = torch.Generator(device=device)
-    generator.manual_seed(0)
+    generator.manual_seed(args.seed)
     q = torch.randn((args.batch, args.heads, args.head_dim), generator=generator, device=device, dtype=dtype)
     k = torch.randn((args.batch, args.heads, args.seq_len, args.head_dim), generator=generator, device=device, dtype=dtype)
     v = torch.randn((args.batch, args.heads, args.seq_len, args.head_dim), generator=generator, device=device, dtype=dtype)
+    lengths = _resolve_lengths(args, device)
 
     if args.backend == "dense":
         def run() -> torch.Tensor:
-            return reference_attention(q, k, v)
+            return reference_attention(q, k, v, lengths=lengths)
 
         stats = {
             "dense_kv_bytes": float(2 * k.numel() * k.element_size()),
@@ -364,9 +478,9 @@ def main() -> None:
         vq = quantize_int8_per_block(v, block_size=args.block_size)
 
         def run() -> torch.Tensor:
-            return fused_dequant_attention(q, kq, vq)
+            return fused_dequant_attention(q, kq, vq, lengths=lengths)
 
-        _, stats = fused_dequant_attention(q, kq, vq, return_stats=True)
+        _, stats = fused_dequant_attention(q, kq, vq, lengths=lengths, return_stats=True)
     elif args.backend == "triton_fused":
         if not HAS_TRITON:
             raise RuntimeError("triton_fused backend 需要安装 Triton：python -m pip install -e \".[triton]\"")
@@ -377,11 +491,18 @@ def main() -> None:
         vq = quantize_int8_per_block(v, block_size=args.block_size)
 
         def run() -> torch.Tensor:
-            return fused_dequant_attention_triton(q, kq, vq)
+            return fused_dequant_attention_triton(q, kq, vq, lengths=lengths)
 
-        _, stats = fused_dequant_attention_triton(q, kq, vq, return_stats=True)
+        _, stats = fused_dequant_attention_triton(q, kq, vq, lengths=lengths, return_stats=True)
     elif args.backend == "paged":
-        cache = PagedKVCache.from_dense(k, v, block_size=args.block_size)
+        cache = PagedKVCache.from_dense(
+            k,
+            v,
+            block_size=args.block_size,
+            lengths=lengths,
+            block_table_pattern=args.paged_layout,
+            layout_seed=args.layout_seed,
+        )
 
         def run() -> torch.Tensor:
             return paged_quant_attention(q, cache)
@@ -393,7 +514,14 @@ def main() -> None:
         if device.type != "cuda":
             raise RuntimeError("triton_paged backend 需要 CUDA 设备，请使用 --device cuda 或 --device auto")
 
-        cache = PagedKVCache.from_dense(k, v, block_size=args.block_size)
+        cache = PagedKVCache.from_dense(
+            k,
+            v,
+            block_size=args.block_size,
+            lengths=lengths,
+            block_table_pattern=args.paged_layout,
+            layout_seed=args.layout_seed,
+        )
 
         def run() -> torch.Tensor:
             return paged_quant_attention_triton(q, cache)
@@ -427,6 +555,13 @@ def main() -> None:
         "seq_len": args.seq_len,
         "head_dim": args.head_dim,
         "block_size": args.block_size,
+        "seed": args.seed,
+        "length_pattern": args.length_pattern,
+        "effective_lengths": [int(x) for x in lengths.detach().cpu().tolist()],
+        "effective_min_seq_len": int(lengths.min().item()),
+        "effective_max_seq_len": int(lengths.max().item()),
+        "paged_layout": args.paged_layout,
+        "paged_layout_seed": args.layout_seed,
         "iters": args.iters,
         "warmup": args.warmup,
         "repeats": args.repeats,
@@ -450,8 +585,10 @@ def main() -> None:
         # kernel tile / 环境覆盖：后续优化实验必须能从 JSON 反查真实运行配置。
         # 目前 block_n 由 Triton backend stats 回填；portable backend 无此概念。
         "block_n": stats.get("block_n"),
+        "num_warps": stats.get("num_warps"),
         "env_flashspec_num_splits": os.environ.get("FLASHSPEC_NUM_SPLITS"),
         "env_flashspec_block_n": os.environ.get("FLASHSPEC_BLOCK_N"),
+        "env_flashspec_num_warps": os.environ.get("FLASHSPEC_NUM_WARPS"),
         "bandwidth_fields_are_estimates": True,
         "estimated_effective_dense_kv_bandwidth_gbps": dense_bandwidth,
         "estimated_effective_quant_kv_bandwidth_gbps": quant_bandwidth,
@@ -473,6 +610,11 @@ def main() -> None:
         "measured_ncu_kernel_names": None,
         "profiler_metrics_source": "nsight_compute_required_for_dram_occupancy_sm",
         "nsight_compute_command": _nsight_compute_command(args),
+        "nsight_compute_source_command": _nsight_compute_source_command(args),
+        "nsight_compute_commands": {
+            "metrics_csv": _nsight_compute_command(args),
+            "source_instruction_report": _nsight_compute_source_command(args),
+        },
         "latency_breakdown": _latency_breakdown(args, stats, latency_ms, timing_method),
         "output_checksum": float(out.float().sum().item()),
     }

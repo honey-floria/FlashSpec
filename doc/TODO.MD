@@ -52,6 +52,8 @@
 - `--include-raw` 可把 raw latency 写入 JSON，`--raw-output` 可单独保存 raw measurements；
 - JSON 内写入可复制的 `nsight_compute_command`，用于在 A100/Colab 等 CUDA 环境采集 profiler；
 - 新增 `estimated_*` bandwidth 字段和 `measured_*` profiler 字段，`dram bytes`、`achieved bandwidth`、`occupancy`、`SM utilization` 当前先置为 `null`，需要运行 Nsight Compute 后回填。
+- 新增 `scripts/profile_matrix.py`，用于 A100 上批量 sweep Kernel 1 的 `block_n/num_warps/num_splits` 和 Kernel 2 的 `block_n/num_warps/paged_layout/length_pattern`。
+- JSON 同时给出 fast metrics 的 `nsight_compute_command` 和 source-line / instruction 归因用的 `nsight_compute_source_command`。
 
 验收标准：
 
@@ -151,7 +153,7 @@ benchmark 结果未来会用于画图和对比，需要稳定字段：
 验收标准：
 
 - [x] CPU 单测中运行小规模 `microbench.py --backend dense --json` smoke test；
-- [x] microbench JSON 顶层保留实验旋钮：`num_splits`、`block_n`、`env_flashspec_num_splits`、`env_flashspec_block_n`；
+- [x] microbench JSON 顶层保留实验旋钮：`num_splits`、`block_n`、`num_warps`、`env_flashspec_*`、`length_pattern`、`paged_layout`；
 - [x] `scripts/analyze_results.py` 的 `summary.csv` 导出 ncu 诊断列，便于复核实验；
 - [ ] sweep CSV fieldnames schema 测试；
 - [ ] e2e serving JSON schema 测试；

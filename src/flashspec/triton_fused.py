@@ -392,6 +392,24 @@ def _resolve_block_n() -> int:
     return 64
 
 
+def _resolve_num_warps() -> int:
+    """Triton program 的 warp 数。默认 4，可用环境变量做 profiling sweep。
+
+    早期 A100 实测显示 8 warp 比 4 warp 慢，但后续会结合 block_n/Split-K
+    做矩阵验证；因此这里保留开关，避免每次实验都改代码。
+    """
+
+    override = os.environ.get("FLASHSPEC_NUM_WARPS")
+    if override is not None:
+        try:
+            v = int(override)
+        except ValueError:
+            v = 0
+        if v in (1, 2, 4, 8):
+            return v
+    return 4
+
+
 def _run_fused_dequant_attention_triton(
     q: torch.Tensor,
     k_quant: QuantizedTensor,
@@ -427,6 +445,7 @@ def _run_fused_dequant_attention_triton(
     # block_n 是每个 program 每轮扫描的 token 数（实验 4：可用 FLASHSPEC_BLOCK_N 覆盖）。
     # tile [block_n, block_d] 越小，registers_per_thread 越低、占用率天花板越高。
     block_n = _resolve_block_n()
+    num_warps = _resolve_num_warps()
     out = torch.empty_like(q_contig)
     sm_scale = 1.0 / math.sqrt(float(head_dim))
 
@@ -454,9 +473,7 @@ def _run_fused_dequant_attention_triton(
             lengths is not None,
             block_n,
             block_d,
-            # num_warps=4：A100 实测 num_warps=8 相比 4 全面变慢（每 program 活量
-            # 太小，跨 warp 归约开销翻倍）。长序列走下方 Split-K 分支填满 SM。
-            num_warps=4,
+            num_warps=num_warps,
         )
     else:
         # Split-K：把 seq_len 切成 num_splits 段并行，grid=(batch*heads, S)。
@@ -492,7 +509,7 @@ def _run_fused_dequant_attention_triton(
             chunk_tokens,
             block_n,
             block_d,
-            num_warps=4,
+            num_warps=num_warps,
         )
         _combine_splits_kernel[(rows,)](
             partial_m,
@@ -502,7 +519,7 @@ def _run_fused_dequant_attention_triton(
             num_splits,
             head_dim,
             block_d,
-            num_warps=4,
+            num_warps=num_warps,
         )
 
     if not return_stats:
@@ -519,6 +536,8 @@ def _run_fused_dequant_attention_triton(
         "num_splits": float(num_splits),
         # 每轮扫描 token 数（实验 4 降寄存器 A/B 变量）。
         "block_n": float(block_n),
+        # 每个 Triton program 的 warp 数（实验 5 profiling matrix 变量）。
+        "num_warps": float(num_warps),
     }
     return out, stats
 

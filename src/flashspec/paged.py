@@ -53,20 +53,34 @@ class PagedKVCache:
         return int(self.k_quant.original_shape[-1])
 
     @classmethod
-    def from_dense(cls, k: torch.Tensor, v: torch.Tensor, block_size: int = 16) -> "PagedKVCache":
+    def from_dense(
+        cls,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_size: int = 16,
+        *,
+        lengths: torch.Tensor | None = None,
+        block_table_pattern: str = "contiguous",
+        layout_seed: int = 0,
+    ) -> "PagedKVCache":
         """从 dense KV tensor 构建分页 INT8 KV cache。
 
         参数：
         - k/v: dense KV，形状为 [batch, heads, seq_len, head_dim]。
         - block_size: 每个分页 block 包含的 token 数。
+        - lengths: 可选的每条 request 有效长度；用于 profiling variable length decode。
+        - block_table_pattern: 物理 block 布局。``contiguous`` 保持默认连续布局，
+          ``shuffled`` 随机打乱物理 block，``interleaved`` 按 logical block 交错排列。
+        - layout_seed: ``shuffled`` 布局的随机种子。
 
         返回：
         - PagedKVCache，内部会把 dense KV 按 sequence 维度切成 block，
           重排为物理 block 布局后再做 per-block INT8 量化。
 
-        当前实现使用最简单的一一映射：
+        默认实现使用最简单的一一映射：
         batch 内每条序列的 logical block 都对应一个独立 physical block，
-        不做 block 复用或复杂内存分配。
+        不做 block 复用或复杂内存分配。profiling 布局只改变 physical block
+        的内存排列和 block_table 映射，不改变逻辑 KV 内容。
         """
 
         if k.ndim != 4 or v.ndim != 4:
@@ -115,8 +129,42 @@ class PagedKVCache:
         )
 
         # block_table[b, logical_block] = physical_block。
-        # 这里 physical block 按 batch-major 顺序连续编号。
+        # 基线 physical block 按 batch-major 顺序连续编号。
         block_table = torch.arange(total_blocks, dtype=torch.int64, device=k.device).reshape(batch, blocks_per_seq)
+
+        pattern = block_table_pattern.strip().lower()
+        if pattern in {"contiguous", ""}:
+            pass
+        elif pattern in {"shuffled", "random"}:
+            generator = torch.Generator(device=k.device)
+            generator.manual_seed(int(layout_seed))
+            perm = torch.randperm(total_blocks, generator=generator, device=k.device)
+            physical_k = physical_k[perm].contiguous()
+            physical_v = physical_v[perm].contiguous()
+            inverse = torch.empty_like(perm)
+            inverse[perm] = torch.arange(total_blocks, dtype=torch.int64, device=k.device)
+            block_table = inverse.reshape(batch, blocks_per_seq)
+        elif pattern == "interleaved":
+            # 让同一 request 的 logical block 在 physical store 中跨 batch 交错，
+            # 用于测 block_table 间接寻址和 L2 locality 对 Kernel 2 的影响。
+            perm = torch.arange(total_blocks, dtype=torch.int64, device=k.device).reshape(batch, blocks_per_seq)
+            perm = perm.transpose(0, 1).contiguous().reshape(-1)
+            physical_k = physical_k[perm].contiguous()
+            physical_v = physical_v[perm].contiguous()
+            inverse = torch.empty_like(perm)
+            inverse[perm] = torch.arange(total_blocks, dtype=torch.int64, device=k.device)
+            block_table = inverse.reshape(batch, blocks_per_seq)
+        else:
+            raise ValueError("block_table_pattern 必须是 contiguous、shuffled 或 interleaved")
+
+        if lengths is None:
+            effective_lengths = torch.full((batch,), seq_len, dtype=torch.int64, device=k.device)
+        else:
+            effective_lengths = lengths.to(device=k.device, dtype=torch.int64).contiguous()
+            if effective_lengths.ndim != 1 or effective_lengths.shape[0] != batch:
+                raise ValueError("lengths 必须是 [batch] 形状")
+            if bool((effective_lengths < 0).any().item()) or bool((effective_lengths > seq_len).any().item()):
+                raise ValueError("lengths 中的有效长度必须位于 [0, seq_len]")
 
         return cls(
             # 对物理 K/V block 分别做 per-block INT8 量化。
@@ -124,8 +172,8 @@ class PagedKVCache:
             v_quant=quantize_int8_per_block(physical_v, block_size=block_size),
             block_table=block_table,
 
-            # from_dense 构建时每条序列长度相同，都是原始 seq_len。
-            lengths=torch.full((batch,), seq_len, dtype=torch.int64, device=k.device),
+            # 默认每条序列长度相同；profiling 可传入 variable lengths。
+            lengths=effective_lengths,
             block_size=block_size,
             max_seq_len=seq_len,
         )

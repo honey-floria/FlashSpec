@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import math
+import os
 
 import torch
 
@@ -185,6 +186,34 @@ def _validate_triton_paged_inputs(q: torch.Tensor, cache: PagedKVCache) -> None:
         raise ValueError("Triton paged attention 当前只支持 head_dim <= 256")
 
 
+def _resolve_block_n() -> int:
+    """Kernel 2 每轮扫描的 logical token 数。默认 64，可用环境变量做 profiling sweep。"""
+
+    override = os.environ.get("FLASHSPEC_BLOCK_N")
+    if override is not None:
+        try:
+            v = int(override)
+        except ValueError:
+            v = 0
+        if v in (16, 32, 64, 128):
+            return v
+    return 64
+
+
+def _resolve_num_warps() -> int:
+    """Triton program 的 warp 数。默认 4，可用环境变量做 profiling sweep。"""
+
+    override = os.environ.get("FLASHSPEC_NUM_WARPS")
+    if override is not None:
+        try:
+            v = int(override)
+        except ValueError:
+            v = 0
+        if v in (1, 2, 4, 8):
+            return v
+    return 4
+
+
 def _run_paged_quant_attention_triton(
     q: torch.Tensor,
     cache: PagedKVCache,
@@ -223,8 +252,10 @@ def _run_paged_quant_attention_triton(
     quant_block_size = int(cache.k_quant.block_size)
     block_d = next_power_of_2(int(head_dim))
 
-    # 和 Kernel 1 保持一致，每次扫描 64 个逻辑 token。
-    block_n = 64
+    # 和 Kernel 1 保持一致，默认每次扫描 64 个逻辑 token；profiling 可用
+    # FLASHSPEC_BLOCK_N 覆盖，用于观察 block_table 间接寻址下的 tile 取舍。
+    block_n = _resolve_block_n()
+    num_warps = _resolve_num_warps()
     out = torch.empty_like(q_contig)
 
     grid = (batch * heads,)
@@ -249,10 +280,7 @@ def _run_paged_quant_attention_triton(
         1.0 / math.sqrt(float(head_dim)),
         block_n,
         block_d,
-        # num_warps=4：A100 实测 num_warps=8 相比 4 全面变慢（每 program 活量太小，
-        # 跨 warp 归约开销翻倍）。paged 提升 occupancy 的正路是 Split-K（见
-        # doc/split-k-plan.md），待 fused 的 Split-K 在 A100 验证后再复制到 paged。
-        num_warps=4,
+        num_warps=num_warps,
     )
 
     if not return_stats:
@@ -267,6 +295,7 @@ def _run_paged_quant_attention_triton(
         "physical_blocks": float(cache.block_table.ge(0).sum().item()),
         "materializes_dense_kv": 0.0,
         "block_n": float(block_n),
+        "num_warps": float(num_warps),
     }
     return out, stats
 

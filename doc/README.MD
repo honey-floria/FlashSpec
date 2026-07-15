@@ -37,8 +37,9 @@ FlashSpec 面向 LLM decode 阶段的 KV cache 带宽瓶颈。目标路径是：
 - benchmark 中的 `estimated_*` bandwidth 字段是根据 KV 字节数和 CUDA event latency 推导的估算值，不是 Nsight Compute 实测值。
 - microbenchmark 的 CUDA 路径已经使用 `torch.cuda.Event` 计时，并输出 warmup/repeat 后的 `latency_p50_ms`、`latency_p90_ms`、`latency_p99_ms` 和 raw latency。
 - JSON 中的 `measured_kernel_latency_ms` 来自 CUDA event；`measured_dram_bytes`、`measured_achieved_bandwidth_gbps`、`measured_occupancy_pct`、`measured_sm_utilization_pct`、`measured_registers_per_thread`、`measured_theoretical_occupancy_pct` 仍需要运行 JSON 里的 `nsight_compute_command` 后回填。
-- JSON 顶层会保留实验配置字段：`num_splits`、`block_n`、`env_flashspec_num_splits`、`env_flashspec_block_n`。优化实验必须优先以这些字段和结果文件为准，避免只凭文件名或 notebook cell 推断运行配置。
+- JSON 顶层会保留实验配置字段：`num_splits`、`block_n`、`num_warps`、`env_flashspec_*`、`length_pattern`、`effective_min_seq_len`、`effective_max_seq_len`、`paged_layout`。优化实验必须优先以这些字段和结果文件为准，避免只凭文件名或 notebook cell 推断运行配置。
 - `latency_breakdown` 是 decode attention 的阶段定义和粗粒度工作量估算，覆盖 KV load、dequant、QK、softmax、PV accumulation、output write；真正的每阶段 latency 需要 Nsight Compute source-line/instruction/memory metrics 进一步归因。
+- microbench JSON 同时给出 `nsight_compute_command`（fast metrics / CSV 回填）和 `nsight_compute_source_command`（source-line / instruction / memory workload 归因）。
 - `materializes_dense_kv=true` 表示该路径仍会创建 dense KV 中间结果。
 - Triton 相关代码已按功能拆分：`triton_fused.py` 实现 Kernel 1 fused dequant attention，`triton_paged.py` 实现 Kernel 2 paged INT8 KV attention，`triton_utils.py` 负责可选 Triton 导入和共享工具，`triton_kernels.py` 只保留兼容导出入口。
 - serving 模拟已经支持 cache append，但 portable append 仍会重新量化物理 block store；真实 serving 还需要 allocator/free list 和 request 生命周期管理。
@@ -59,12 +60,21 @@ python scripts/profile_report.py results/a100_triton_paged.json --output results
 
 报告中的 `nsight_compute_command` 用来采集 DRAM bytes、achieved bandwidth、occupancy、SM utilization、registers/thread 和 theoretical occupancy。采集到这些值后，再回填 `measured_*` 字段，才能把“估算 bandwidth”和“硬件实测 profiler 指标”区分开。
 
+批量 profiling 矩阵：
+
+```bash
+python scripts/profile_matrix.py --backend triton_fused --seq-lens 2048,4096 --head-dims 128 --block-ns 32,64,128 --num-warps 4,8 --num-splits auto,1,4,8 --length-patterns uniform --profile-ncu --output-dir results/profile_matrix/fused
+python scripts/profile_matrix.py --backend triton_paged --seq-lens 2048,4096 --head-dims 128 --block-ns 32,64,128 --num-warps 4,8 --length-patterns uniform,descending --paged-layouts contiguous,shuffled,interleaved --profile-ncu --output-dir results/profile_matrix/paged
+```
+
+`triton_paged` 的 `--paged-layout` 会只改变 physical block store 的排列和 `block_table` 映射，不改变逻辑 KV 内容；这用于隔离 block locality 对 Kernel 2 的影响。
+
 ## 推荐开发顺序
 
 1. [x] Kernel 1：非 paged INT8 KV fused dequant attention（`triton_fused.py`）。
 2. [x] Kernel 2：加入 `block_table` 的 paged INT8 KV attention（`triton_paged.py`）。
 3. 扩展 serving 模拟，支持 variable length、block allocator、request 完成和新增。
 4. 补齐 CUDA、FP16/BF16、边界 shape 和 benchmark schema 测试。
-5. 在真实 A100 环境运行 Nsight Compute，回填 `measured_*` profiler 指标并沉淀实验报告。
+5. 在真实 A100 环境运行 Nsight Compute / profile matrix，回填 `measured_*` profiler 指标并沉淀实验报告。
 
 Kernel 1、2 的代码路径已经完成并在 CUDA + Triton 下有对齐测试；当前重心在第 3~5 步：把 serving 做得更接近真实系统、扩大测试矩阵，并在真实 A100 上采集 profiler 数据。详细任务见 `TODO.MD`。
