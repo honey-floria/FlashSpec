@@ -95,11 +95,16 @@ if HAS_TRITON:
             physical_valid = table_mask & (physical_block >= 0)
 
             # physical block 内部的 sequence 位置还要映射到量化 block。
-            # 当前 PagedKVCache 默认 page_block_size == quant_block_size，因此
-            # physical_quant_block 通常为 0；这里保留通用写法，方便后续扩展。
-            physical_quant_block = page_offset // quant_block_size
-            quant_offset = page_offset - physical_quant_block * quant_block_size
-            qparam_mask = physical_valid & (physical_quant_block < physical_quant_blocks)
+            # 当前主路径 page_block_size == quant_block_size，避免在内层循环做
+            # 恒为 0 的除法/乘法地址计算；非等长配置保留通用路径。
+            if page_block_size == quant_block_size:
+                physical_quant_block = tl.full((block_n,), 0, tl.int64)
+                quant_offset = page_offset
+                qparam_mask = physical_valid
+            else:
+                physical_quant_block = page_offset // quant_block_size
+                quant_offset = page_offset - physical_quant_block * quant_block_size
+                qparam_mask = physical_valid & (physical_quant_block < physical_quant_blocks)
 
             # QuantizedTensor.values 物理布局：
             # [physical_blocks, heads, physical_quant_blocks, quant_block_size, head_dim]。
@@ -186,8 +191,11 @@ def _validate_triton_paged_inputs(q: torch.Tensor, cache: PagedKVCache) -> None:
         raise ValueError("Triton paged attention 当前只支持 head_dim <= 256")
 
 
+_DEFAULT_BLOCK_N = 128
+
+
 def _resolve_block_n() -> int:
-    """Kernel 2 每轮扫描的 logical token 数。默认 64，可用环境变量做 profiling sweep。"""
+    """Kernel 2 每轮扫描的 logical token 数。默认 128，可用环境变量做 profiling sweep。"""
 
     override = os.environ.get("FLASHSPEC_BLOCK_N")
     if override is not None:
@@ -197,7 +205,7 @@ def _resolve_block_n() -> int:
             v = 0
         if v in (16, 32, 64, 128):
             return v
-    return 64
+    return _DEFAULT_BLOCK_N
 
 
 def _resolve_num_warps() -> int:
@@ -252,7 +260,7 @@ def _run_paged_quant_attention_triton(
     quant_block_size = int(cache.k_quant.block_size)
     block_d = next_power_of_2(int(head_dim))
 
-    # 和 Kernel 1 保持一致，默认每次扫描 64 个逻辑 token；profiling 可用
+    # 和 Kernel 1 保持一致，默认每次扫描 128 个逻辑 token；profiling 可用
     # FLASHSPEC_BLOCK_N 覆盖，用于观察 block_table 间接寻址下的 tile 取舍。
     block_n = _resolve_block_n()
     num_warps = _resolve_num_warps()

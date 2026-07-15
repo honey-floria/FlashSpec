@@ -332,17 +332,21 @@ def _validate_triton_fused_inputs(
         raise ValueError("Triton fused attention 当前只支持 head_dim <= 256")
 
 
-# Split-K 自适应参数；实验结论见 doc/optimization-log.md。
-# TOKENS_PER_SPLIT：每段目标 token 数；S_MAX：段数上限，防止 scratch 过大。
+# Split-K 默认参数；实验结论见 doc/optimization-log.md。
+# 矩阵 profiling 显示 s2048/s4096 的 fused 最优点都在 block_n=128,
+# num_warps=4, split=4。短序列仍保留单 kernel 快路径，避免 combine 开销。
+_DEFAULT_BLOCK_N = 128
+_DEFAULT_NUM_SPLITS = 4
 _TOKENS_PER_SPLIT = 512
 _S_MAX = 32
 
 
 def _compute_num_splits(seq_len: int, block_n: int) -> int:
-    """自适应 S = clamp(ceil(seq_len / TOKENS_PER_SPLIT), 1, S_MAX)。
+    """返回 Split-K 段数，默认长序列使用 4 段。
 
-    S==1 时退化回单 kernel 快路径（零 combine 开销）。短序列(512)→1，
-    2048→4，4096→8。段太多不划算，故用 S_MAX 封顶。
+    S==1 时退化回单 kernel 快路径（零 combine 开销）。短序列(<=512)
+    仍用 1 段；A100 full matrix 显示 s2048/s4096 的稳定最优候选是
+    split=4，因此未设置环境变量时长序列默认 4 段。
 
     A/B 开关：环境变量 FLASHSPEC_NUM_SPLITS 可覆盖自适应值，用于在
     num_warps 固定的前提下隔离 Split-K 的纯贡献：
@@ -363,21 +367,24 @@ def _compute_num_splits(seq_len: int, block_n: int) -> int:
             max_splits = max(1, (seq_len + block_n - 1) // block_n)
             return max(1, min(forced, max_splits))
 
+    max_splits = max(1, (seq_len + block_n - 1) // block_n)
     if seq_len <= _TOKENS_PER_SPLIT:
         return 1
-    s = (seq_len + _TOKENS_PER_SPLIT - 1) // _TOKENS_PER_SPLIT
+    s = min(_DEFAULT_NUM_SPLITS, max_splits)
     return max(1, min(s, _S_MAX))
 
 
 def _resolve_block_n() -> int:
-    """每个 program 每轮扫描的 token 数。默认 64。
+    """每个 program 每轮扫描的 token 数。默认 128。
 
-    实验 4（降寄存器）A/B 开关：k_deq/v_deq 临时 tile 是 [block_n, block_d]，
+    profiling matrix 结论：block_n=128 的有效 DRAM throughput 最好；
+    block_n=32 虽然 occupancy 更高但明显更慢。A/B 开关仍保留：
     寄存器占用与 block_n 成正比。调小 block_n 可降低 registers_per_thread、
-    抬高占用率天花板，代价是循环轮数增加。用环境变量隔离该变量：
+    抬高占用率天花板，代价是循环轮数和 MIO/scoreboard 压力增加。
     - FLASHSPEC_BLOCK_N=32  每轮扫 32 token（更少寄存器）；
-    - FLASHSPEC_BLOCK_N=64  默认；
-    - 未设置或非法值        用默认 64。
+    - FLASHSPEC_BLOCK_N=64  旧默认；
+    - FLASHSPEC_BLOCK_N=128 当前默认；
+    - 未设置或非法值        用默认 128。
     限制为 [16, 128] 内的 2 的幂，避免病态 tile 尺寸。
     """
 
@@ -389,7 +396,7 @@ def _resolve_block_n() -> int:
             v = 0
         if v in (16, 32, 64, 128):
             return v
-    return 64
+    return _DEFAULT_BLOCK_N
 
 
 def _resolve_num_warps() -> int:

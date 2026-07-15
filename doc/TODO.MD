@@ -29,31 +29,31 @@
 
 把 full matrix 结论反映到代码默认值和文档中。
 
-- [ ] `triton_fused` 默认使用 `block_n=128`、`num_warps=4`、`num_splits=4`。
-- [ ] `triton_paged` 默认使用 `block_n=128`、`num_warps=4`。
-- [ ] 保留 `FLASHSPEC_BLOCK_N`、`FLASHSPEC_NUM_WARPS`、`FLASHSPEC_NUM_SPLITS` override。
-- [ ] 单点复跑确认默认值和 manifest 最优点一致。
+- [x] `triton_fused` 默认使用 `block_n=128`、`num_warps=4`、`num_splits=4`。
+- [x] `triton_paged` 默认使用 `block_n=128`、`num_warps=4`。
+- [x] 保留 `FLASHSPEC_BLOCK_N`、`FLASHSPEC_NUM_WARPS`、`FLASHSPEC_NUM_SPLITS` override。
+- [ ] A100 单点复跑确认默认值和 manifest 最优点一致。
 
 验收标准：
 
-- 默认 microbench 输出字段与预期默认参数一致。
-- CUDA correctness 测试通过。
-- A100 sanity profiling 不退化。
+- [x] 默认参数 helper 与预期默认参数一致。
+- [ ] CUDA correctness 测试通过。
+- [ ] A100 sanity profiling 不退化。
 
 ### 2. 增加 matrix manifest 自动分析脚本
 
 现在 full matrix 结论主要靠手动读 CSV。需要脚本化，保证以后上传 manifest 后可以直接生成结论。
 
-- [ ] 新增 `scripts/analyze_matrix.py`。
-- [ ] 输出每个 backend/shape 的 top-k latency。
-- [ ] 输出 `block_n`、`num_warps`、`num_splits`、`paged_layout` 对比。
-- [ ] 输出 Markdown summary。
+- [x] 新增 `scripts/analyze_matrix.py`。
+- [x] 输出每个 backend/shape 的 top-k latency。
+- [x] 输出 `block_n`、`num_warps`、`num_splits`、`paged_layout` 对比。
+- [x] 输出 Markdown summary。
 - [ ] 可选：生成 heatmap 或 CSV summary。
 
 验收标准：
 
-- 输入 `results/profile_matrix` 后自动生成一份稳定报告。
-- 报告能复现当前 full matrix 的主要结论。
+- [x] 输入 `results/profile_matrix` 后自动生成一份稳定报告。
+- [x] 报告能复现当前 full matrix 的主要结论。
 
 ### 3. 做 source-line / instruction 归因
 
@@ -61,12 +61,12 @@
 
 优先点：
 
-- [ ] fused 最优：`s2048/d128, block_n=128, num_warps=4, split=4`。
+- [x] fused 最优：`s2048/d128, block_n=128, num_warps=4, split=4`。
 - [ ] fused 最优：`s4096/d128, block_n=128, num_warps=4, split=4`。
-- [ ] paged uniform 最优：`block_n=128, num_warps=4, contiguous`。
-- [ ] paged shuffled 慢点。
-- [ ] `block_n=32` 慢点。
-- [ ] `num_warps=8` 慢点。
+- [x] paged uniform 最优：`block_n=128, num_warps=4, contiguous`。
+- [x] paged shuffled 慢点。
+- [x] `block_n=32` 慢点。
+- [x] `num_warps=8` 慢点。
 
 关注指标：
 
@@ -78,8 +78,8 @@
 
 验收标准：
 
-- `optimization-log.md` 中补一节 source-line 归因结论。
-- 能解释 paged 相对 fused 的 `12-15%` gap 主要来自哪里。
+- [x] `optimization-log.md` 中补一节 source-line 归因结论。
+- [x] 能解释 paged 相对 fused 的 `12-15%` gap 主要来自哪里。
 
 ## P1：Serving 模拟可信化
 

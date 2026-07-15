@@ -39,7 +39,7 @@ num_splits = 4  # triton_fused
 - `block_n=32` 不适合作为默认。它降低寄存器、提高 occupancy，但 latency 和 DRAM throughput 明显变差。
 - `num_warps=8` 也不适合作为默认。它通常比 `num_warps=4` 慢。
 - paged uniform 相对 fused 最优慢约 12-15%，这是当前 block_table/paged path 的主要优化空间。
-- 下一步 profiling 应进入 source-line / instruction attribution，而不是继续盲目扩大参数矩阵。
+- source-line / instruction attribution 已确认：继续追 occupancy 不是主线，下一步应减少 MIO/scoreboard 等待和 paged 地址计算开销。
 
 完整实验过程和历史结论见 [doc/optimization-log.md](doc/optimization-log.md)。
 
@@ -113,6 +113,7 @@ PROFILE_NCU = False      # 只看 latency，适合快速筛候选
 ```text
 results/profile_matrix/fused/triton_fused_manifest.csv
 results/profile_matrix/paged/triton_paged_manifest.csv
+results/profile_matrix_report.md
 ```
 
 普通分析只需要这两个 manifest。只有要做单点 `profile_report` 或 source-line 归因时，才需要对应 JSON。
@@ -147,6 +148,15 @@ python scripts/profile_matrix.py --backend triton_paged \
   --length-patterns uniform,descending \
   --paged-layouts contiguous,shuffled,interleaved \
   --profile-ncu --output-dir results/profile_matrix/paged
+```
+
+生成稳定矩阵报告：
+
+```bash
+python scripts/analyze_matrix.py \
+  --matrix-dir results/profile_matrix \
+  --source-dir results/ncu_source_attribution_export \
+  --output results/profile_matrix_report.md
 ```
 
 汇总单点 JSON 图表：
@@ -219,13 +229,13 @@ doc/
 
 - full matrix 目前主要覆盖 `head_dim=128`、`seq_len={2048,4096}`，还需要补 `head_dim=64`、短序列和更多 request length 分布。
 - `triton_paged` 已有真实 paged KV path，但 serving allocator 仍是简化版，还没有完整 free list、request lifecycle 和 fragmentation 统计。
-- `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时。真实归因需要 source-line / instruction / memory workload metrics。
+- `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时；关键 s2048 点已补 source-line / instruction / memory workload 归因，s4096 best-point 仍待复核。
 - 随机 tensor 不能代表真实模型 KV 分布；量化误差还需要真实模型 KV sample workflow。
 
 ## 下一步
 
-1. 将默认 kernel 参数收敛到 `block_n=128, num_warps=4, split=4`，并保留 env override。
-2. 对 fused 最优点、paged 最优点和 paged shuffled 慢点跑 source-line / instruction 归因。
-3. 增加 matrix manifest 自动分析脚本，自动输出 top-k 和参数对比。
-4. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
+1. 在 A100 上补 s4096 fused/paged best-point source attribution，确认 s2048 结论可外推。
+2. 继续做 attribution-driven kernel patch：减少 shared staging / dequant / softmax 更新里的 MIO、short scoreboard，以及 paged block_table 地址计算。
+3. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
+4. 补真实模型 KV sample workflow，验证量化误差和随机 tensor profiling 的差异。
 5. 补测试矩阵和 CI。

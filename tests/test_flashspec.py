@@ -22,6 +22,8 @@ from flashspec import (
     quantize_int8_per_block,
     reference_attention,
 )
+import flashspec.triton_fused as triton_fused
+import flashspec.triton_paged as triton_paged
 from flashspec.triton_kernels import HAS_TRITON
 
 
@@ -56,6 +58,34 @@ class FlashSpecTest(unittest.TestCase):
         actual, stats = fused_dequant_attention_triton(q, kq, vq, return_stats=True)
         torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
         self.assertEqual(stats["materializes_dense_kv"], 1.0)
+
+    def test_triton_default_knobs_match_profiled_best(self) -> None:
+        old = {key: os.environ.get(key) for key in ("FLASHSPEC_NUM_SPLITS", "FLASHSPEC_BLOCK_N", "FLASHSPEC_NUM_WARPS")}
+        try:
+            for key in old:
+                os.environ.pop(key, None)
+
+            self.assertEqual(triton_fused._resolve_block_n(), 128)
+            self.assertEqual(triton_fused._resolve_num_warps(), 4)
+            self.assertEqual(triton_fused._compute_num_splits(seq_len=2048, block_n=128), 4)
+            self.assertEqual(triton_fused._compute_num_splits(seq_len=4096, block_n=128), 4)
+            self.assertEqual(triton_paged._resolve_block_n(), 128)
+            self.assertEqual(triton_paged._resolve_num_warps(), 4)
+
+            os.environ["FLASHSPEC_BLOCK_N"] = "64"
+            os.environ["FLASHSPEC_NUM_WARPS"] = "8"
+            os.environ["FLASHSPEC_NUM_SPLITS"] = "1"
+            self.assertEqual(triton_fused._resolve_block_n(), 64)
+            self.assertEqual(triton_fused._resolve_num_warps(), 8)
+            self.assertEqual(triton_fused._compute_num_splits(seq_len=2048, block_n=64), 1)
+            self.assertEqual(triton_paged._resolve_block_n(), 64)
+            self.assertEqual(triton_paged._resolve_num_warps(), 8)
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
     def test_triton_fused_attention_matches_dequant_reference_on_cuda(self) -> None:

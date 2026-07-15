@@ -376,6 +376,44 @@ Paged locality / variable length 观察：
 
 重点看 `SourceCounters / InstructionStats / MemoryWorkloadAnalysis / SchedulerStats` 中的 integer/address 指令、global load efficiency、L1/L2 hit、long scoreboard、issue stall 和 local memory spill。
 
+**2026-07-15 source-line / instruction 归因结果（`results/ncu_source_attribution*`）**
+
+本轮已经采集并导出 6 个 `.ncu-rep`：
+
+- fused best: `s2048/d128, bn128, nw4, split4`；
+- fused slow tile: `s2048/d128, bn32, nw4, split4`；
+- fused slow warps: `s2048/d128, bn128, nw8, split1`；
+- fused slow warps: `s2048/d128, bn128, nw8, split4`；
+- paged best: `s2048/d128, bn128, nw4, uniform, contiguous`；
+- paged locality slow: `s2048/d128, bn128, nw4, uniform, shuffled`。
+
+主 kernel 对比：
+
+| case | NCU kernel time | regs | theo occ | DRAM BW | issue/cycle | active warps | eligible warps | main stalls |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| fused `bn128,nw4,split4` | `303.0 us` | 168 | 18.75% | `901.4 GB/s` | 0.48 | 2.86 | 0.72 | wait 24.3%, long scoreboard 13.7%, short scoreboard 12.3%, mio 9.0% |
+| fused `bn32,nw4,split4` | `473.8 us` | 72 | 43.75% | `576.9 GB/s` | 0.42 | 6.28 | 0.82 | mio 23.4%, short scoreboard 23.1%, long scoreboard 13.8% |
+| fused `bn128,nw8,split1` | `447.0 us` | 120 | 25.00% | `608.2 GB/s` | 0.36 | 3.63 | 0.62 | mio 23.0%, long scoreboard 18.1%, wait 14.0% |
+| fused `bn128,nw8,split4` | `481.4 us` | 119 | 25.00% | `567.3 GB/s` | 0.35 | 3.89 | 0.57 | long scoreboard 30.8%, mio 16.7%, wait 13.8% |
+| paged contiguous `bn128,nw4` | `353.6 us` | 168 | 18.75% | `768.9 GB/s` | 0.43 | 2.48 | 0.60 | wait 26.7%, long scoreboard 15.8%, short scoreboard 11.6%, mio 8.8% |
+| paged shuffled `bn128,nw4` | `355.1 us` | 168 | 18.75% | `765.7 GB/s` | 0.43 | 2.48 | 0.59 | wait 25.8%, long scoreboard 16.8%, short scoreboard 11.4%, mio 9.0% |
+
+归因更新：
+
+- `block_n=32` 的慢因已确认不是寄存器/occupancy。它把寄存器从 168 降到 72、理论 occupancy 从 18.75% 拉到 43.75%，但主 kernel 时间从 `303 us` 增到 `474 us`，DRAM BW 从 `901 GB/s` 掉到 `577 GB/s`，`mio_throttle` 和 `short_scoreboard` 都升到约 23%。这说明小 tile 提高了表面 occupancy，但增加了每个 token 的 shared-memory/调度压力和指令开销，反而降低有效访存吞吐。
+- `num_warps=8` 也不是可行方向。`split1` 已经比 best 慢，`split4` 更慢；`split4,nw8` 的 long scoreboard 升到 `30.8%`，eligible warps 只有 `0.57`，issue/cycle 只有 `0.35`。更多 warps 没有隐藏访存延迟，反而扩大 scoreboard 等待和调度低效。
+- paged 相对 fused 的 s2048 gap 在 source attribution 中表现为更低 DRAM BW / issue efficiency，而不是 local spill 或 L2 sector inefficiency：paged contiguous 主 kernel `768.9 GB/s / issue 0.43`，fused best 是 `901.4 GB/s / issue 0.48`；两者 L2 theoretical sectors 都等于 ideal，`local_sectors=0`。
+- paged contiguous 与 shuffled 在这次 source report 中几乎完全一致：kernel time `353.6 us` vs `355.1 us`，DRAM BW `768.9` vs `765.7 GB/s`，stall 分布也接近。之前 full matrix 中 shuffled 的 event latency 明显慢，更可能是运行波动或外部测量窗口差异；当前没有证据表明 shuffled layout 在这个 s2048/uniform 点引入了稳定的 memory coalescing/cache 问题。
+- 具体下一步不应优先继续降寄存器或追 occupancy，而应优先减少 `bn128,nw4` 路径上的无效指令和等待：检查 shared staging / dequant / softmax 更新里的 MIO、short scoreboard 来源；paged 路径重点看 block table 地址计算和额外 global load 是否能合并或搬出内层循环。
+
+**2026-07-15 profiling 结论落地到代码**
+
+- `triton_fused` 默认参数收敛到 `block_n=128, num_warps=4`，长序列默认 `num_splits=4`；短序列仍保留单 kernel 快路径。
+- `triton_paged` 默认参数收敛到 `block_n=128, num_warps=4`。
+- 保留 `FLASHSPEC_BLOCK_N`、`FLASHSPEC_NUM_WARPS`、`FLASHSPEC_NUM_SPLITS` 覆盖，用于后续 A/B 和回归定位。
+- paged kernel 对当前主路径 `page_block_size == quant_block_size` 增加编译期快路径，避免内层循环里恒为 0 的 `physical_quant_block` 除法/乘法地址计算；非等长配置保留通用路径。
+- 新增 `scripts/analyze_matrix.py`，从 `results/profile_matrix` 和 `results/ncu_source_attribution_export` 生成稳定 Markdown 报告 `results/profile_matrix_report.md`。
+
 **2026-07-15 文档与脚本收口**
 
 根据 full matrix 结果，项目文档从“设计草案 + 多份历史说明”收口为三份主文档：
