@@ -331,6 +331,51 @@ Paged locality / variable length 观察：
 3. 若继续优化寄存器，不再优先靠 `block_n` 或 `num_warps` 降寄存器，而是缩短 q/acc/softmax 状态和 offset/qparam 地址张量生命周期，并检查 spill。
 4. 对 paged 优先优化 block_table/locality 路径；uniform 下目标是缩小相对 fused 的 `12-15%` gap。
 
+**2026-07-15 full matrix fast-metrics 归因分析**
+
+当前上传的是 full matrix JSON + NCU fast metrics，尚未包含 `.ncu-rep` 或 source-line/instruction 导出。因此本节是基于
+`measured_dram_bytes / achieved bandwidth / DRAM throughput / SM utilization / occupancy / registers` 的归因，不是逐源码行或 SASS 指令归因。
+
+总体相关性：
+
+| backend | latency vs measured BW | latency vs DRAM throughput | latency vs occupancy | 解读 |
+|---|---:|---:|---:|---|
+| triton_fused | -0.69 | -0.69 | +0.43 | 越能打满 DRAM 越快；occupancy 越高反而常常更慢 |
+| triton_paged | -0.57 | -0.57 | +0.53 | 同样主要受访存效率影响，而不是 occupancy 数字 |
+
+这说明当前优化目标应是提高有效访存/调度效率，而不是单纯追 occupancy。`block_n=32` 和 `num_warps=8` 都是典型反例：它们降低寄存器或提高 occupancy，但 DRAM throughput 明显下降。
+
+按参数组平均：
+
+| backend | block_n | num_warps | avg latency | avg BW | avg DRAM throughput | avg occupancy | avg regs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fused | 32 | 4 | 0.5910 ms | 567.6 GB/s | 36.5% | 36.7% | 74 |
+| fused | 64 | 4 | 0.4478 ms | 771.8 GB/s | 49.6% | 24.1% | 109.5 |
+| fused | 128 | 4 | 0.3880 ms | 900.7 GB/s | 57.9% | 17.5% | 168 |
+| fused | 128 | 8 | 0.5671 ms | 605.8 GB/s | 39.0% | 24.1% | 119.2 |
+| paged | 32 | 4 | 0.6789 ms | 396.5 GB/s | 25.5% | 27.4% | 72 |
+| paged | 64 | 4 | 0.4876 ms | 574.9 GB/s | 37.0% | 26.0% | 96 |
+| paged | 128 | 4 | 0.4284 ms | 657.2 GB/s | 42.3% | 15.5% | 168 |
+| paged | 128 | 8 | 0.5588 ms | 491.0 GB/s | 31.6% | 22.7% | 128 |
+
+归因结论：
+
+- `block_n=32` 慢的主因不是寄存器，而是访存/调度效率下降。以 fused s2048 为例，最佳 `bn128,nw4` 是 `0.2555 ms / 59.1% DRAM throughput / 18.0% occupancy`；`bn32,nw4` 是 `0.3801 ms / 38.0% / 39.1%`。occupancy 翻高但 latency 慢约 `+48.8%`。
+- `num_warps=8` 慢的主因也不是 occupancy 不够，而是每个 program 的有效工作/访存效率下降。fused s2048 最佳 `nw8` 比 `bn128,nw4` 慢约 `+49.1%`，DRAM throughput 从 `59.1%` 降到 `40.2%`。
+- paged uniform 相对 fused 的 gap 主要体现为更多 DRAM bytes 和更低 DRAM throughput。s2048 最优点中，fused NCU 窗口约 `855 MB / 918.9 GB/s / 59.1%`，paged 约 `1409 MB / 790.7 GB/s / 50.8%`；s4096 中 fused 约 `1666 MB / 931.6 GB/s / 59.9%`，paged 约 `2761 MB / 789.4 GB/s / 50.8%`。
+- paged 的额外成本很可能来自 block_table 间接寻址、physical block 非连续访问、额外地址计算和较差 coalescing/cache behavior。fast metrics 只能证明“多读/低 throughput”，不能定位到具体哪一行。
+- paged layout 在 s2048 更敏感：`bn128,nw4,uniform` 下 contiguous/interleaved/shuffled event latency 分别为 `0.2859/0.2891/0.3572 ms`。但这三个点的 fast metrics DRAM throughput 很接近，说明 event latency 差异可能来自 source-line 级 stall、cache/scoreboard 或测量波动；需要 source-line/instruction 报告确认。
+
+下一步真正的 source-line 归因应只跑少数点：
+
+1. fused best: `s2048/d128, bn128, nw4, split4`；
+2. fused slow tile: `s2048/d128, bn32, nw4, split4`；
+3. fused slow warps: `s2048/d128, bn128, nw8, split1/4`；
+4. paged best: `s2048/d128, bn128, nw4, uniform, contiguous`；
+5. paged locality slow: `s2048/d128, bn128, nw4, uniform, shuffled`。
+
+重点看 `SourceCounters / InstructionStats / MemoryWorkloadAnalysis / SchedulerStats` 中的 integer/address 指令、global load efficiency、L1/L2 hit、long scoreboard、issue stall 和 local memory spill。
+
 **2026-07-15 文档与脚本收口**
 
 根据 full matrix 结果，项目文档从“设计草案 + 多份历史说明”收口为三份主文档：
