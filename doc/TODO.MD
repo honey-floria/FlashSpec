@@ -13,102 +13,112 @@
 - [x] `microbench.py` 支持 CUDA event timing、raw latency、`estimated_*` 和 `measured_*` profiler 字段。
 - [x] `--profile-ncu` 可直接采集 Nsight Compute fast metrics。
 - [x] `scripts/profile_matrix.py` 支持 fused/paged 参数矩阵。
-- [x] Colab A100 full matrix + NCU 已完成，结果记录在 `doc/optimization-log.md`。
+- [x] `scripts/analyze_matrix.py` 可从 matrix manifest 和 source attribution export 生成稳定 Markdown 报告。
+- [x] Colab A100 full matrix + NCU 已完成，结果记录在 `doc/optimization-log.md` 和 `results/profile_matrix_report.md`。
+- [x] A100 默认候选已复跑，默认方向仍为 `block_n=128, num_warps=4`，fused 使用 `num_splits=4`。
 - [x] `run.ipynb` 已整理为 Colab A100 runbook。
 
 ### 当前事实结论
 
-- 推荐默认候选：`block_n=128, num_warps=4`。
-- `triton_fused` 推荐 Split-K 候选：`num_splits=4`。
-- `block_n=32` 和 `num_warps=8` 当前都不适合作为默认。
-- paged uniform 相对 fused 最优仍有约 `12-15%` latency gap，是下一阶段主要优化空间。
+- 当前 matrix 结果仍以 `results/profile_matrix/*/*_manifest.csv` 为准，共 120 个点。
+- `triton_fused` 最优点：
+  - s2048/d128: `block_n=128, num_warps=4, split=4`，latency 约 `0.2555 ms`。
+  - s4096/d128: `block_n=128, num_warps=4, split=4`，latency 约 `0.4856 ms`。
+- `triton_paged` uniform 最优点：
+  - s2048/d128: `block_n=128, num_warps=4, contiguous`，latency 约 `0.2858 ms`。
+  - s4096/d128: `block_n=128, num_warps=4, contiguous`，latency 约 `0.5604 ms`。
+- `block_n=32` 和 `num_warps=8` 仍不适合作为默认：它们提高表面 occupancy，但降低 DRAM throughput 和 issue efficiency。
+- paged uniform 相对 fused 最优仍有约 `12-15%` latency gap，是下一阶段 kernel 层主要优化空间。
+- `results/ncu_source_attribution/` 已包含 s4096 fused/paged best-point `.ncu-rep`；当前本地 `results/ncu_source_attribution_export/` 还缺 s4096 的 CSV/TXT 导出，因此 `profile_matrix_report.md` 的 Source Attribution Summary 暂时只汇总了 s2048 attribution。
+- `results/colab_kernels/analysis/summary.csv` 比部分 `results/colab_kernels/*.json` 更新；单点 JSON 目录存在旧结果混入。后续归档时不要直接把 `colab_kernels/*.json` 全部当成最新默认验收依据。
 
-## P0：收口当前 kernel/profiling 结论
+## P0：结果归档和文档收口
 
-### 1. 固化默认 kernel 参数
+### 1. 补齐 s4096 source attribution 导出
 
-把 full matrix 结论反映到代码默认值和文档中。
-
-- [x] `triton_fused` 默认使用 `block_n=128`、`num_warps=4`、`num_splits=4`。
-- [x] `triton_paged` 默认使用 `block_n=128`、`num_warps=4`。
-- [x] 保留 `FLASHSPEC_BLOCK_N`、`FLASHSPEC_NUM_WARPS`、`FLASHSPEC_NUM_SPLITS` override。
-- [ ] A100 单点复跑确认默认值和 manifest 最优点一致。
-
-验收标准：
-
-- [x] 默认参数 helper 与预期默认参数一致。
-- [ ] CUDA correctness 测试通过。
-- [ ] A100 sanity profiling 不退化。
-
-### 2. 增加 matrix manifest 自动分析脚本
-
-现在 full matrix 结论主要靠手动读 CSV。需要脚本化，保证以后上传 manifest 后可以直接生成结论。
-
-- [x] 新增 `scripts/analyze_matrix.py`。
-- [x] 输出每个 backend/shape 的 top-k latency。
-- [x] 输出 `block_n`、`num_warps`、`num_splits`、`paged_layout` 对比。
-- [x] 输出 Markdown summary。
-- [ ] 可选：生成 heatmap 或 CSV summary。
+- [ ] 在有 `ncu` 的环境中导出 s4096 `.ncu-rep`：
+  - `fused_best_s4096_d128_bn128_nw4_split4.ncu-rep`
+  - `paged_best_s4096_d128_bn128_nw4_uniform_contiguous.ncu-rep`
+- [ ] 生成对应 CSV/TXT 到 `results/ncu_source_attribution_export/`。
+- [ ] 重新运行 `scripts/analyze_matrix.py`，让 `results/profile_matrix_report.md` 的 Source Attribution Summary 包含 s4096。
+- [ ] 把 s4096 attribution 结论补进 `doc/optimization-log.md`。
 
 验收标准：
 
-- [x] 输入 `results/profile_matrix` 后自动生成一份稳定报告。
-- [x] 报告能复现当前 full matrix 的主要结论。
+- [ ] `results/ncu_source_attribution_export/` 中存在 s4096 fused/paged CSV 和 TXT。
+- [ ] `results/profile_matrix_report.md` Source Attribution Summary 同时包含 s2048 和 s4096。
+- [ ] `optimization-log.md` 明确说明 s4096 是否验证了 s2048 的归因结论。
 
-### 3. 做 source-line / instruction 归因
+### 2. 清理 profiling 结果边界
 
-当前已经知道最优参数，但还需要解释 paged gap、`block_n=32` 变慢和 `num_warps=8` 变慢的具体来源。
-
-优先点：
-
-- [x] fused 最优：`s2048/d128, block_n=128, num_warps=4, split=4`。
-- [ ] fused 最优：`s4096/d128, block_n=128, num_warps=4, split=4`。
-- [x] paged uniform 最优：`block_n=128, num_warps=4, contiguous`。
-- [x] paged shuffled 慢点。
-- [x] `block_n=32` 慢点。
-- [x] `num_warps=8` 慢点。
-
-关注指标：
-
-- address calculation / integer instruction overhead；
-- dequant 指令占比；
-- long scoreboard stall；
-- memory workload / global load efficiency；
-- register pressure 和 spill。
+- [ ] 明确 `results/profile_matrix/*/*_manifest.csv` 是正式 matrix 结果来源。
+- [ ] 检查 `results/colab_kernels/*.json`，把旧单点结果移动到历史目录或重新生成。
+- [ ] 重新生成 `results/colab_kernels/analysis/summary.csv`，保证 summary 和实际 JSON 一致。
+- [ ] 在 README 里说明哪些 `results/` 文件是正式结论，哪些只是历史单点样本。
 
 验收标准：
 
-- [x] `optimization-log.md` 中补一节 source-line 归因结论。
-- [x] 能解释 paged 相对 fused 的 `12-15%` gap 主要来自哪里。
+- [ ] `summary.csv` 中的关键行和对应 JSON 文件字段一致。
+- [ ] README 不再让读者误把旧单点 JSON 当作当前默认结果。
+- [ ] `git status --short` 保持干净。
 
 ## P1：Serving 模拟可信化
 
-### 4. PagedKVCache allocator
+### 3. PagedKVCache allocator
 
-当前 serving loop 只能证明 paged path 可以跑通，还不是真实 allocator。
+当前 `PagedKVCache.append()` 已经不是从完整 dense cache 重建，但仍会反量化并重新量化完整 physical block store。下一步要加入真实 allocator 概念，让 serving loop 能表达 request lifecycle、block 复用和碎片。
 
-- [ ] block free list。
-- [ ] request -> block list 生命周期管理。
-- [ ] append token 时只更新目标 block。
-- [ ] request 完成后释放 block。
+- [ ] 新增 allocator 数据结构，管理固定容量 physical blocks。
+- [ ] 实现 block free list。
+- [ ] 实现 `request_id -> logical block list -> physical block` 生命周期管理。
+- [ ] append token 时只定位并更新目标 request 的最后一个 block；跨 block 边界时才分配新 block。
+- [ ] request 完成后释放该 request 占用的 physical blocks。
 - [ ] 支持 batch 内 request 新增和结束。
-- [ ] 输出 block utilization 和 fragmentation。
+- [ ] 输出 allocator stats：
+  - allocated blocks
+  - free blocks
+  - live requests
+  - used tokens
+  - capacity tokens
+  - block utilization
+  - padding waste / fragmentation
 
 验收标准：
 
-- decode step 不重建完整 cache。
-- benchmark 能报告 utilization / fragmentation。
+- [ ] decode step 不重建完整 cache。
+- [ ] append 跨 block 边界时只新增必要 block。
+- [ ] request 结束后 block 能被后续 request 复用。
+- [ ] benchmark 能报告 utilization / fragmentation。
+- [ ] CPU correctness 测试覆盖 allocator append、release、reuse。
 
-### 5. 区分 prefill 和 decode
+### 4. Serving benchmark：prefill/decode 分离
 
-- [ ] `e2e_serving.py` 支持 prompt length list 或分布参数。
-- [ ] 输出 prefill time、decode time、TTFT、TPOT、tokens/s。
-- [ ] 支持 variable prompt length。
+- [ ] `benchmarks/e2e_serving.py` 支持 prompt length list，例如 `--prompt-lens 512,1024,2048`。
+- [ ] 支持 prompt length 分布参数，例如 uniform/random/bimodal。
+- [ ] 明确区分 prefill cache build time 和 decode loop time。
+- [ ] 输出 TTFT、TPOT、tokens/s。
+- [ ] 输出 allocator utilization / fragmentation。
+- [ ] 支持 batch 内不同 request length。
+- [ ] 支持 request arrival / finish 的简单模拟。
 
 验收标准：
 
-- serving benchmark 更接近真实请求流。
-- 结果可以和 paged cache allocator 指标关联。
+- [ ] serving benchmark 不再只是一组固定长度请求的 smoke test。
+- [ ] JSON 输出能把 latency 指标和 allocator 指标关联起来。
+- [ ] README 给出一个标准 serving benchmark 命令和示例输出字段。
+
+### 5. Serving JSON schema 测试
+
+- [ ] 为 `e2e_serving.py --json` 增加 schema smoke test。
+- [ ] 检查必需字段：
+  - `ttft_ms`
+  - `tpot_ms`
+  - `tokens_per_second`
+  - `prefill_ms`
+  - `decode_ms`
+  - `block_utilization`
+  - `fragmentation`
+- [ ] 确认 CPU 环境下测试可运行，不依赖 CUDA。
 
 ## P1：测试和工程质量
 
@@ -120,27 +130,62 @@
 - [ ] variable lengths。
 - [ ] append 跨 block 边界。
 - [ ] batch 内不同 lengths。
+- [ ] allocator release/reuse。
 - [ ] invalid shape / error path。
 
-### 7. Benchmark schema 测试
+验收标准：
+
+- [ ] CPU reference 测试稳定通过。
+- [ ] CUDA/Triton 环境下 kernel correctness 覆盖当前默认参数和主要边界。
+
+### 7. Benchmark schema 和报告测试
 
 - [x] microbench JSON smoke test。
 - [x] microbench JSON 顶层保留 `num_splits`、`block_n`、`num_warps`、`length_pattern`、`paged_layout`。
 - [x] `analyze_results.py` 导出 NCU 诊断列。
 - [ ] sweep CSV fieldnames schema test。
-- [ ] e2e serving JSON schema test。
 - [ ] matrix manifest schema test。
+- [ ] `analyze_matrix.py` output smoke test，避免报告列名或 source summary 退化。
+- [ ] `profile_report.py` output smoke test。
 
 ### 8. CI 和格式化
 
 - [ ] 增加 CPU unit test CI。
 - [ ] CUDA/Triton 测试作为可选 job。
 - [ ] 增加 lint/format 配置。
-- [ ] 避免 benchmark JSON、IDE 文件和 `__pycache__` 进入版本控制。
+- [ ] 明确哪些 `results/` 产物纳入版本控制。
+- [ ] 避免临时 benchmark JSON、IDE 文件和 `__pycache__` 进入版本控制。
+
+## P2：Kernel 后续优化
+
+### 9. Paged path 地址计算优化
+
+source attribution 显示 paged 相对 fused 的主要 gap 是较低 DRAM BW / issue efficiency，而不是 local spill。下一步应针对 block table 和地址计算做小步 A/B。
+
+- [ ] 审查 `triton_paged` 内层循环的 block table load、physical block index 和 quant block offset 计算。
+- [ ] 尝试把可复用地址计算移出内层循环。
+- [ ] 对 `page_block_size == quant_block_size` 的快路径继续做专门化，减少恒等除法/乘法。
+- [ ] 每个 patch 只跑小矩阵 + source attribution，不再盲目跑 full matrix。
+
+验收标准：
+
+- [ ] s2048/s4096 paged uniform 相对 fused 的 gap 有可测下降。
+- [ ] 不牺牲 correctness 和 variable length 支持。
+
+### 10. MIO / short scoreboard 来源定位
+
+- [ ] 对 `block_n=128,nw4` 主路径检查 shared staging、dequant、softmax update 的指令和依赖链。
+- [ ] 避免回到单纯追 occupancy 的方向。
+- [ ] 若尝试降寄存器，必须同时检查 DRAM throughput、issue/cycle、MIO 和 scoreboard，而不是只看 regs/occupancy。
+
+验收标准：
+
+- [ ] 每个 kernel patch 都有明确的 profiling 假设、命令、结果和结论。
+- [ ] `optimization-log.md` 继续按“动机 -> 做法 -> 结果 -> 原因分析 -> 结论”追加。
 
 ## P2：量化和真实模型评估
 
-### 9. 量化策略对比
+### 11. 量化策略对比
 
 当前是 per-block affine INT8。后续可以比较：
 
@@ -153,10 +198,10 @@
 
 验收标准：
 
-- 输出 attention output error、top-k attention drift、latency 和 storage cost。
-- 给出推荐默认量化配置。
+- [ ] 输出 attention output error、top-k attention drift、latency 和 storage cost。
+- [ ] 给出推荐默认量化配置。
 
-### 10. 真实模型 KV 分布
+### 12. 真实模型 KV 分布
 
 随机 tensor 只能验证工程流程，不能代表真实 LLM KV 分布。
 
@@ -167,7 +212,7 @@
 
 验收标准：
 
-- 文档说明真实 KV 分布下的误差和风险。
+- [ ] 文档说明真实 KV 分布下的误差和风险。
 
 ## 文档维护规则
 

@@ -414,6 +414,38 @@ Paged locality / variable length 观察：
 - paged kernel 对当前主路径 `page_block_size == quant_block_size` 增加编译期快路径，避免内层循环里恒为 0 的 `physical_quant_block` 除法/乘法地址计算；非等长配置保留通用路径。
 - 新增 `scripts/analyze_matrix.py`，从 `results/profile_matrix` 和 `results/ncu_source_attribution_export` 生成稳定 Markdown 报告 `results/profile_matrix_report.md`。
 
+**2026-07-15 已做优化复盘：做法、原因分析与原理**
+
+这一轮优化的核心结论是：FlashSpec decode attention 不是简单的“occupancy 越高越快”问题，而是一个由有效访存吞吐、指令调度效率、scoreboard 等待和寄存器压力共同决定的 memory-bound kernel。下面按已经做过的优化和基础设施改造做阶段性复盘。
+
+| 项目 | 做法 | 结果 | 原因分析 / 原理 | 当前结论 |
+|---|---|---|---|---|
+| fused INT8 KV attention | 在 Triton kernel 内直接读取 INT8 K/V、scale、zero，并完成 dequant、QK、online softmax、PV | 避免 portable backend 先 materialize dense KV 的额外写回 | decode attention 主要受 HBM 读写限制；把反量化融合进 attention 可以减少中间 dense KV 的显存流量 | 保留为 Kernel 1 主路径 |
+| paged INT8 KV attention | 通过 `block_table` 间接寻址 physical KV blocks，kernel 内直接访问 paged INT8 KV | 功能正确，uniform 场景相对 fused 慢约 `12-15%` | paged path 多了 block table load、physical block 地址计算和更复杂的索引路径；fast metrics 显示 paged 读到更多 DRAM bytes，且 DRAM BW / issue efficiency 低于 fused | 保留为 Kernel 2 主路径；下一步优化 block table / 地址计算 |
+| `num_warps=8` | 把每个 program 的 warp 数从 4 增到 8 | 全面变慢，full matrix 中最佳 `nw8` 仍比 `bn128,nw4` 慢约 `29-49%` | 每个 program 的工作量没有变，只是把同一块 `block_n x head_dim` 工作拆给更多 warp；跨 warp 归约、同步和 scoreboard 等待增加。source attribution 中 `nw8,split4` long scoreboard 到 `30.8%`，issue/cycle 只有 `0.35` | 不作为默认；保留环境变量仅用于回归定位 |
+| Split-K / Flash-Decoding | 把 seq_len 维度切成多段并行，输出 partial online-softmax 状态，再用 combine kernel 合并 | full matrix 中 fused s2048/s4096 最优都在 `split=4`；s2048 `0.2555 ms`，s4096 `0.4856 ms` | online softmax 的 `(m,l,acc)` 状态可以按段合并，数学上与 kernel 内跨 block rescale 同构。收益不是来自 occupancy 提升，而是来自更细的 wave 粒度和更好的尾部效应；combine 开销被更好的 DRAM throughput 抵消 | fused 长序列默认 `num_splits=4`；短序列继续走单 kernel 快路径 |
+| 增加 NCU 诊断字段 | 在 microbench / parser 中加入 registers/thread、theoretical occupancy、DRAM throughput、SM utilization 等字段 | 证明很多“提高 occupancy”的尝试没有变快 | A100 上 theoretical occupancy 由每 SM 寄存器容量、每 block 线程数、每线程寄存器数决定。`reg/thread` 从 96 到 168 时 occupancy 下降，但如果 DRAM throughput 和 issue efficiency 上升，latency 仍会下降 | 后续所有优化必须同时看 latency、DRAM BW、issue、stall，不能只看 occupancy |
+| `block_n=32` 降寄存器 | 把每轮扫描 token 数从 64/128 降到 32，以期降低 tile 临时变量和寄存器 | 明显变慢；source attribution 中主 kernel 从 `303 us` 增到 `474 us`，DRAM BW 从 `901 GB/s` 掉到 `577 GB/s` | 小 tile 确实降低寄存器并提高理论 occupancy，但循环次数、地址计算、shared/memory issue 压力变大；`mio_throttle` 和 `short_scoreboard` 升到约 23%，有效访存吞吐下降 | 不作为默认；降寄存器不能靠盲目缩小 tile |
+| `block_n=128` 默认 | full matrix 覆盖 `block_n={32,64,128}` 后，将默认改为 128 | fused/paged 在 s2048/s4096 都优于 `block_n=64`；fused 最优 DRAM throughput 约 `59-60%` | 较大 scan tile 减少循环和地址计算开销，提高每次 global load 的有效利用。虽然寄存器更高、occupancy 更低，但有效 DRAM throughput 更好 | fused/paged 默认都使用 `block_n=128` |
+| paged layout profiling | 给 `PagedKVCache.from_dense()` 增加 `contiguous/shuffled/interleaved` physical block 布局 | full matrix 中 s2048 shuffled event latency 明显慢，但 source attribution 中 s2048 contiguous/shuffled 主 kernel 几乎一致 | layout 对 event latency 有影响，但当前 source report 没证明稳定的 coalescing/L2 sector 问题；差异可能来自测量窗口、cache 状态或外部波动 | 不基于单次 shuffled 结果做代码默认改动；后续看更多 request lifecycle 和 allocator 场景 |
+| paged equal-block fast path | 当 `page_block_size == quant_block_size` 时，编译期跳过内层循环里恒为 0 的 `physical_quant_block` 除法/乘法 | 已落到代码，作为当前主路径的轻量优化 | 当前项目主配置中 page block 和 quant block 相同，logical token offset 与 quant block offset 可以简化；用 `tl.constexpr` 分支把通用路径开销移出主路径 | 保留；后续继续审查 block table load 和地址计算能否外提 |
+| matrix / source attribution 基础设施 | 新增 `scripts/profile_matrix.py`、`scripts/analyze_matrix.py`、source attribution export 流程 | profiling 从手工单点变成可复现矩阵和稳定 Markdown 报告 | kernel 优化容易被单点噪声误导；矩阵能区分 shape-dependent 最优、参数交互和失败方向；source attribution 用来验证 fast metrics 的归因假设 | 之后每个 kernel patch 都必须走“小矩阵筛选 -> 少量 source attribution -> 写入日志”的流程 |
+
+**原理总结**
+
+1. **decode attention 的并行度天然受限**：query 只有一个 token，天然 grid 约为 `batch * heads`。Split-K 能增加 block 数，但如果每个 block 的寄存器/共享资源限制了 per-SM resident blocks，occupancy 不会线性上升。
+2. **occupancy 只是上限指标，不是目标函数**：`block_n=32` 和 `num_warps=8` 都能改善表面 occupancy 或降低寄存器，但它们降低了 DRAM throughput 和 issue efficiency，所以 latency 变差。
+3. **有效访存吞吐更接近当前性能主因**：full matrix 中 latency 与 measured BW / DRAM throughput 负相关，而与 occupancy 正相关；也就是更高 occupancy 往往出现在更慢配置里。
+4. **online softmax 允许正确 Split-K 合并**：每段保存局部 `m`、`l`、`acc` 后，可以用与块内 rescale 相同的公式合并 partial 状态，因此 Split-K 是数学等价优化，不是近似。
+5. **paged path 的代价主要来自索引路径**：相比 fused，paged 多读 block table 并做 physical block 地址计算；当前证据显示 gap 主要是更低 DRAM BW / issue efficiency，而不是 local spill 或 L2 sector 理论低效。
+
+**后续优化约束**
+
+- 不再以“提高 occupancy”作为单独优化目标。任何降寄存器、改 tile、改 warp 的 patch，都必须同时报告 latency、DRAM throughput、issue/cycle、long/short scoreboard、MIO stall。
+- 不再盲目跑 full matrix。新 patch 先跑目标 shape 小矩阵，只有候选变好后再对关键点跑 source-line / instruction attribution。
+- paged path 的下一步应优先优化 block table / 地址计算 / request lifecycle，而不是继续调 `block_n` 或 `num_warps`。
+- 当前 `results/ncu_source_attribution/` 已有 s4096 fused/paged best-point `.ncu-rep`，但本地导出的 `results/ncu_source_attribution_export/` 还缺 s4096 CSV/TXT；s4096 source attribution 结论需要导出后再补充到本节。
+
 **2026-07-15 文档与脚本收口**
 
 根据 full matrix 结果，项目文档从“设计草案 + 多份历史说明”收口为三份主文档：
