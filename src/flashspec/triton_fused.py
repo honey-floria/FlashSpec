@@ -332,7 +332,7 @@ def _validate_triton_fused_inputs(
         raise ValueError("Triton fused attention 当前只支持 head_dim <= 256")
 
 
-# Split-K 自适应参数（见 doc/split-k-plan.md）。
+# Split-K 自适应参数；实验结论见 doc/optimization-log.md。
 # TOKENS_PER_SPLIT：每段目标 token 数；S_MAX：段数上限，防止 scratch 过大。
 _TOKENS_PER_SPLIT = 512
 _S_MAX = 32

@@ -1,53 +1,47 @@
 # FlashSpec
 
-FlashSpec 是一个面向 LLM decode 阶段的工程项目。它的目标是针对 decode attention 的显存带宽瓶颈，把 KV cache 存成 paged INT8 block，并在 attention 路径里融合反量化，减少 FP16 KV 从 HBM 到 SM 的搬运量。
+FlashSpec 是一个面向 LLM decode 阶段的 kernel/profiling 工程项目。目标是把 KV cache 存成 paged INT8 blocks，并在 attention kernel 内直接完成反量化、QK、softmax 和 PV，减少 decode attention 对 HBM 带宽的压力。
 
-本仓库对应 `doc/deep_engineering_project.svg` 里的技术地图：
+当前项目已经完成两条 Triton 主路径：
 
-- Kernel 1：INT8 KV 的 fused dequant-attention。
-- Kernel 2：带 `block_table` 间接寻址的 paged quant-KV attention。
-- Profiling：roofline 输入、latency breakdown、microbenchmark。
-- Serving：一个最小 decode loop，用来跑通 paged cache 路径。
+- Kernel 1: `triton_fused`，连续 INT8 KV 的 fused dequant attention。
+- Kernel 2: `triton_paged`，通过 `block_table` 间接寻址的 paged INT8 KV attention。
 
-当前代码包含可移植 PyTorch 后端，方便在 CPU 和 CUDA 上验证 correctness、分页数据结构和 benchmark 流程。PyTorch 后端会 materialize dense KV；Kernel 1 已提供可选 Triton fused dequant attention 后端，在 CUDA + Triton 环境中直接读取 INT8 KV 并在 kernel 内完成反量化、QK、softmax 和 PV。Kernel 2 也已提供可选 Triton paged attention 后端，在 kernel 内读取 `block_table` 并直接寻址 physical INT8 KV block。
+这不是生产级 serving runtime。它现在更准确地说是一个可复现的 kernel optimization case study：包含 correctness、microbenchmark、A100 profiling matrix、Nsight Compute fast metrics 和优化日志。
 
-## 后端一览
+## 当前结论
 
-| backend | 说明 | 设备要求 | `materializes_dense_kv` |
-|---|---|---|---|
-| `dense` | FP16/FP32 dense reference attention，作为 baseline | CPU / CUDA | false |
-| `fused` | Kernel 1 的 portable PyTorch 参考实现，先反量化再走 dense attention | CPU / CUDA | true |
-| `triton_fused` | Kernel 1 的 Triton 实现，kernel 内直接读 INT8 KV | CUDA + Triton | false |
-| `paged` | Kernel 2 的 portable PyTorch 参考实现，先 `to_dense()` 还原 KV | CPU / CUDA | true |
-| `triton_paged` | Kernel 2 的 Triton 实现，kernel 内按 `block_table` 间接寻址 | CUDA + Triton | false |
+截至 2026-07-15，Colab A100 full matrix + NCU 已跑完：
 
-在没有 CUDA/Triton 的环境里，`triton_fused` / `triton_paged` 的 Python 入口会自动回退到对应 portable 实现，保证代码可导入、可 smoke test；benchmark 脚本则会显式报错，避免把 CPU 数字误当成 Triton kernel 性能。
+- `triton_fused`: 48 个点，覆盖 `block_n={32,64,128}`、`num_warps={4,8}`、`num_splits={auto,1,4,8}`。
+- `triton_paged`: 72 个点，覆盖 `block_n={32,64,128}`、`num_warps={4,8}`、`length_pattern={uniform,descending}`、`paged_layout={contiguous,shuffled,interleaved}`。
+- 120 个点全部有 `measured_achieved_bandwidth_gbps`、DRAM throughput、occupancy 和 registers/thread，无 `profiler_error`。
 
-## 当前实现边界
+当前最稳的默认候选是：
 
-- `fused` 后端是 portable PyTorch 参考实现，会 materialize dense KV；`triton_fused` 后端是 Kernel 1 的 Triton 实现，CUDA 主路径不 materialize dense KV。
-- `paged` 后端是 portable PyTorch 参考实现，仍会通过 `cache.to_dense()` 还原 KV；`triton_paged` 后端是 Kernel 2 的 Triton 实现，会在 kernel 内按 `block_table` 间接寻址 physical block。
-- microbenchmark 使用 CUDA event 记录 GPU latency，输出 `latency_p50_ms`、`latency_p90_ms`、raw measurements、`estimated_*` 和 `measured_*` 字段。KV bandwidth 仍是基于字节数和 latency 的估算值，JSON 中的 `bandwidth_fields_are_estimates` 会标记这一点；DRAM bytes、occupancy、SM utilization、registers/thread 和 theoretical occupancy 需要用 JSON 中的 Nsight Compute 命令采集后回填。用于内核实验的 `num_splits`、`block_n`、`num_warps`、`env_flashspec_*`、`length_pattern` 和 `paged_layout` 也会写入 JSON，方便复核真实运行配置。
-- `materializes_dense_kv=true` 表示该后端在当前 PyTorch 实现里会先还原 dense KV，再执行 reference attention。
-- serving 模拟使用 paged cache 的增量 `append` 路径，不再在每个 decode step 从完整 dense KV 重新构建 cache；但 portable 后端仍会为了 correctness 反量化物理 block。
-
-## Colab A100 快速开始
-
-在 Colab 里先选择 `Runtime -> Change runtime type -> A100 GPU`，然后运行：
-
-```bash
-git clone <your-repo-url> FlashSpec
-cd FlashSpec
-python -m pip install -e .
-python - <<'PY'
-import torch
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu")
-PY
+```text
+block_n = 128
+num_warps = 4
+num_splits = 4  # triton_fused
 ```
 
-如果你把项目文件直接上传到了 Colab 当前目录，从 `python -m pip install -e .` 开始执行即可。
+关键结果：
+
+| backend | 场景 | 最优配置 | latency |
+|---|---|---|---:|
+| `triton_fused` | s2048/d128 | `block_n=128, num_warps=4, split=4` | 0.2555 ms |
+| `triton_fused` | s4096/d128 | `block_n=128, num_warps=4, split=4` | 0.4856 ms |
+| `triton_paged` | s2048/d128 uniform | `block_n=128, num_warps=4, contiguous` | 0.2859 ms |
+| `triton_paged` | s4096/d128 uniform | `block_n=128, num_warps=4, contiguous` | 0.5604 ms |
+
+结论：
+
+- `block_n=32` 不适合作为默认。它降低寄存器、提高 occupancy，但 latency 和 DRAM throughput 明显变差。
+- `num_warps=8` 也不适合作为默认。它通常比 `num_warps=4` 慢。
+- paged uniform 相对 fused 最优慢约 12-15%，这是当前 block_table/paged path 的主要优化空间。
+- 下一步 profiling 应进入 source-line / instruction attribution，而不是继续盲目扩大参数矩阵。
+
+完整实验过程和历史结论见 [doc/optimization-log.md](doc/optimization-log.md)。
 
 ## 安装
 
@@ -57,7 +51,7 @@ PY
 python -m pip install -e .
 ```
 
-如果要继续写真正的 Triton kernel：
+Triton 路径：
 
 ```bash
 python -m pip install -e ".[triton]"
@@ -71,147 +65,167 @@ python -m unittest discover -s tests
 
 测试覆盖：
 
-- 量化/反量化 round trip 的误差边界；
-- fused dequant attention 对齐 dense attention；
-- Triton fused/paged 入口在 CPU 上回退并对齐 portable 实现；
-- paged KV cache 能还原 dense KV；
-- paged KV cache append 后仍能还原和执行 attention；
-- paged attention 对齐非 paged 的 quantized attention；
-- Triton fused/paged kernel 在 CUDA 上对齐 reference（无 GPU 时自动 skip）。
+- INT8 quant/dequant round trip；
+- dense reference attention；
+- portable fused/paged reference；
+- paged KV cache 和 `block_table`；
+- append 后的 paged cache correctness；
+- CUDA + Triton 下的 `triton_fused` / `triton_paged` correctness，无 GPU 时自动 skip；
+- microbench JSON schema 的关键字段。
 
-共 14 个用例。在纯 CPU 环境下 10 个运行、4 个 CUDA/Triton 用例自动 skip：
+## 后端
+
+| backend | 说明 | 是否分页 | 是否 materialize dense KV |
+|---|---|---:|---:|
+| `dense` | FP16/FP32 dense reference attention | 否 | 否 |
+| `fused` | portable PyTorch INT8 reference，先反量化再 dense attention | 否 | 是 |
+| `triton_fused` | Triton Kernel 1，kernel 内读 INT8 KV 并反量化 | 否 | 否 |
+| `paged` | portable PyTorch paged reference，通过 `cache.to_dense()` 验证 | 是 | 是 |
+| `triton_paged` | Triton Kernel 2，kernel 内通过 `block_table` 读 physical INT8 blocks | 是 | 否 |
+
+`fused` 和 `paged` 是 correctness/reference 路径；真实性能结论应优先看 `triton_fused` 和 `triton_paged`。
+
+## Colab A100 流程
+
+推荐直接使用 [run.ipynb](run.ipynb)。顺序是：
+
+1. 挂载 Google Drive。
+2. 检查 A100 / CUDA / Triton / Nsight Compute。
+3. 跑 correctness tests。
+4. 跑 sanity profiling。
+5. 跑 matrix profiling。
+6. 汇总 manifest 和图表。
+7. 对关键 JSON 生成 profile report 或 source-line 命令。
+
+矩阵 profiling 的 notebook 开关：
+
+```python
+MATRIX_PRESET = "dry"    # 只打印命令
+MATRIX_PRESET = "small"  # 关键组合
+MATRIX_PRESET = "full"   # 完整矩阵
+
+PROFILE_NCU = True       # 采集 Nsight Compute fast metrics，慢但有硬件指标
+PROFILE_NCU = False      # 只看 latency，适合快速筛候选
+```
+
+结果位置：
 
 ```text
-Ran 14 tests in ...s
-OK (skipped=4)
+results/profile_matrix/fused/triton_fused_manifest.csv
+results/profile_matrix/paged/triton_paged_manifest.csv
 ```
 
-在 CUDA + Triton 环境（如 Colab A100）下 4 个 skip 用例会真正运行，验证 Triton kernel 输出与 dequant reference 对齐，并断言 `materializes_dense_kv=false`。
+普通分析只需要这两个 manifest。只有要做单点 `profile_report` 或 source-line 归因时，才需要对应 JSON。
 
-## A100 Microbenchmark
+## 常用命令
 
-脚本默认 `--device auto --dtype auto`：检测到 CUDA 时自动使用 `cuda + float16`，并在计时前后执行 `torch.cuda.synchronize()`。
-
-Dense baseline：
+单点 microbenchmark：
 
 ```bash
-python benchmarks/microbench.py --backend dense --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --warmup 10 --repeats 20 --json
+python benchmarks/microbench.py \
+  --backend triton_fused \
+  --batch 16 --heads 32 --seq-len 2048 --head-dim 128 \
+  --block-size 16 --iters 50 --warmup 10 --repeats 20 \
+  --device cuda --dtype float16 \
+  --json --include-raw --profile-ncu \
+  --output results/triton_fused_s2048_d128.json
 ```
 
-Kernel 1 路径：
+full matrix：
 
 ```bash
-python benchmarks/microbench.py --backend fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --warmup 10 --repeats 20 --json
+python scripts/profile_matrix.py --backend triton_fused \
+  --seq-lens 2048,4096 --head-dims 128 \
+  --block-ns 32,64,128 --num-warps 4,8 \
+  --num-splits auto,1,4,8 \
+  --length-patterns uniform \
+  --profile-ncu --output-dir results/profile_matrix/fused
+
+python scripts/profile_matrix.py --backend triton_paged \
+  --seq-lens 2048,4096 --head-dims 128 \
+  --block-ns 32,64,128 --num-warps 4,8 \
+  --length-patterns uniform,descending \
+  --paged-layouts contiguous,shuffled,interleaved \
+  --profile-ncu --output-dir results/profile_matrix/paged
 ```
 
-Kernel 1 Triton fused 路径：
+汇总单点 JSON 图表：
 
 ```bash
-python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --warmup 10 --repeats 20 --json
+python scripts/analyze_results.py \
+  --results-dir results/colab_kernels \
+  --output-dir results/colab_kernels/analysis
 ```
 
-Kernel 2 路径：
+生成单点 profile report：
 
 ```bash
-python benchmarks/microbench.py --backend paged --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 20 --json
+python scripts/profile_report.py \
+  results/colab_kernels/triton_fused_s2048_d128.json \
+  --output results/colab_kernels/triton_fused_s2048_d128_profile.md
 ```
 
-Kernel 2 Triton paged 路径：
+batch/seq sweep：
 
 ```bash
-python benchmarks/microbench.py --backend triton_paged --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 20 --json
+python benchmarks/sweep.py \
+  --backends dense,triton_fused,triton_paged \
+  --batches 1,4,8,16 \
+  --seq-lens 512,1024,2048,4096 \
+  --heads 32 --head-dim 128 \
+  --iters 20 --warmup 5 --repeats 10 \
+  --output results/a100_sweep.csv
 ```
 
-保存 JSON：
+serving smoke benchmark：
 
 ```bash
-python benchmarks/microbench.py --backend triton_paged --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --warmup 10 --repeats 20 --json --include-raw --output results/a100_triton_paged.json --raw-output results/a100_triton_paged_raw.json
+python benchmarks/e2e_serving.py \
+  --requests 32 --prompt-len 1024 --decode-steps 64 \
+  --heads 32 --head-dim 128 --json
 ```
-
-输出字段包括 `latency_ms`、`latency_p50_ms`、`latency_p90_ms`、`tokens_per_second`、估算 KV 字节数、压缩比、`materializes_dense_kv`、`num_splits`、`block_n`、`env_flashspec_*`、`estimated_effective_*_bandwidth_gbps`、`measured_*` profiler 占位字段、`nsight_compute_command` 和 `latency_breakdown`。`latency_breakdown` 给出 KV load、dequant、QK、softmax、PV accumulation、output write 的阶段定义和粗粒度工作量估算。
-
-Kernel profiling 矩阵（A100 上运行）：
-
-```bash
-python scripts/profile_matrix.py --backend triton_fused --seq-lens 2048,4096 --head-dims 128 --block-ns 32,64,128 --num-warps 4,8 --num-splits auto,1,4,8 --length-patterns uniform --profile-ncu --output-dir results/profile_matrix/fused
-python scripts/profile_matrix.py --backend triton_paged --seq-lens 2048,4096 --head-dims 128 --block-ns 32,64,128 --num-warps 4,8 --length-patterns uniform,descending --paged-layouts contiguous,shuffled,interleaved --profile-ncu --output-dir results/profile_matrix/paged
-```
-
-`triton_paged` 可用 `--paged-layout` 比较 contiguous/shuffled/interleaved physical block 布局，用 `--length-pattern` 比较 uniform/variable length；JSON 里的 `nsight_compute_source_command` 用于 source-line / instruction 归因。
-
-## Batch × Seq Len Sweep
-
-```bash
-python benchmarks/sweep.py --backends dense,triton_fused,triton_paged --batches 1,4,8,16 --seq-lens 512,1024,2048,4096 --heads 32 --head-dim 128 --iters 20 --warmup 5 --repeats 10 --output results/a100_sweep.csv
-```
-
-这个 CSV 可以直接用于画 Pareto 曲线：batch size、sequence length、tokens/s、p50/p90 latency、估算 bandwidth。
-
-## 端到端 Serving 模拟
-
-```bash
-python benchmarks/e2e_serving.py --requests 32 --prompt-len 1024 --decode-steps 64 --heads 32 --head-dim 128 --json
-```
-
-这不是模型质量 benchmark，而是系统路径 benchmark。它会构建初始 paged quant-KV cache，并在 decode loop 中通过 `append` 追加新 token，输出 TTFT、TPOT 和 tokens/s。
-
-## Roofline SVG
-
-生成 A100 版本 roofline 草图：
-
-```bash
-python scripts/profile_roofline.py --peak-tflops 312 --bandwidth-gbps 1555 --intensity 1.0 --achieved-tflops 1.5 --output results/a100_roofline.svg
-```
-
-脚本会生成自包含 SVG，不依赖 matplotlib。
 
 ## 项目结构
 
 ```text
 src/flashspec/
   attention.py       dense / quantized decode attention API
-  quant.py           per-block affine INT8 量化
-  paged.py           paged quant-KV cache 和 block_table
-  runtime.py         auto device / dtype / CUDA synchronize
-  serving.py         最小 decode serving loop
-  triton_utils.py    Triton 可选导入和共享工具
-  triton_fused.py    Kernel 1：INT8 KV fused dequant attention
-  triton_paged.py    Kernel 2：paged INT8 KV attention
-  triton_kernels.py  Triton 兼容导出入口
+  quant.py           per-block affine INT8 quantization
+  paged.py           paged quant-KV cache and block_table
+  runtime.py         device / dtype helpers
+  serving.py         minimal decode serving loop
+  ncu_parse.py       Nsight Compute CSV parser
+  triton_fused.py    Kernel 1: fused INT8 KV attention
+  triton_paged.py    Kernel 2: paged INT8 KV attention
+  triton_utils.py    optional Triton import helpers
+  triton_kernels.py  compatibility exports
+
 benchmarks/
-  microbench.py      kernel 级 latency 和 bandwidth 估算
-  e2e_serving.py     decode loop benchmark
-  sweep.py           batch × seq len 扫描
+  microbench.py      kernel latency / bandwidth / NCU collection
+  sweep.py           batch x seq_len sweep
+  e2e_serving.py     minimal serving benchmark
+
 scripts/
-  profile_report.py
-  profile_matrix.py
-  profile_roofline.py
-tests/
-  test_flashspec.py
+  profile_matrix.py  matrix profiling runner
+  analyze_results.py single-point JSON aggregation and plots
+  profile_report.py  Markdown report for one JSON
+
+doc/
+  optimization-log.md experiment history and profiling conclusions
+  TODO.MD             remaining work and milestones
 ```
 
-## 更多文档
+## 当前边界
 
-- `doc/README.MD`：设计背景、当前实现边界和推荐开发顺序。
-- `doc/TODO.MD`：按优先级拆分的后续工程任务、验收标准和里程碑。
-- `doc/deep_engineering_project.svg`：项目技术地图。
+- full matrix 目前主要覆盖 `head_dim=128`、`seq_len={2048,4096}`，还需要补 `head_dim=64`、短序列和更多 request length 分布。
+- `triton_paged` 已有真实 paged KV path，但 serving allocator 仍是简化版，还没有完整 free list、request lifecycle 和 fragmentation 统计。
+- `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时。真实归因需要 source-line / instruction / memory workload metrics。
+- 随机 tensor 不能代表真实模型 KV 分布；量化误差还需要真实模型 KV sample workflow。
 
-## 在 A100 上做真实 Profiling
+## 下一步
 
-建议先用 microbenchmark 固定 shape；JSON 会给出一条可复制的 `nsight_compute_command`。运行该命令后，再把 Nsight Compute 中的 DRAM bytes、achieved bandwidth、occupancy、SM utilization、registers/thread 和 theoretical occupancy 回填到 `measured_*` 字段或报告中。
-
-示例：
-
-```bash
-python benchmarks/microbench.py --backend triton_paged --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --iters 50 --warmup 10 --repeats 20 --device cuda --dtype float16 --json --output results/a100_triton_paged.json
-python scripts/profile_report.py results/a100_triton_paged.json --output results/a100_triton_paged_profile.md
-```
-
-重点记录：
-
-- KV cache 读取字节数；
-- achieved memory bandwidth；
-- arithmetic intensity；
-- KV load / QK matmul / softmax / value accumulation 的 latency breakdown；
-- batch size 和 sequence length sweep 下的 TPOT、tokens/s；
-- dense baseline、fused dequant、paged quant-KV 三条路径对比。
+1. 将默认 kernel 参数收敛到 `block_n=128, num_warps=4, split=4`，并保留 env override。
+2. 对 fused 最优点、paged 最优点和 paged shuffled 慢点跑 source-line / instruction 归因。
+3. 增加 matrix manifest 自动分析脚本，自动输出 top-k 和参数对比。
+4. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
+5. 补测试矩阵和 CI。

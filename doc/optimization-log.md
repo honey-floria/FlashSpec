@@ -296,6 +296,64 @@ Paged locality / variable length 观察：
 3. fused 默认候选优先测试 `block_n=128`，Split-K 根据 `seq_len` 分段选择。
 4. paged 继续重点看 block_table locality：`contiguous/shuffled/interleaved` + source-line，确认 long scoreboard 或地址计算是否是主要损耗。
 
+**2026-07-15 full matrix + NCU 结果（`results/profile_matrix/*/*manifest.csv`）**
+
+新的 manifest 已覆盖 full 矩阵，并且这次 120 个点全部带 NCU fast metrics：
+
+- `triton_fused`: 48 个点，`block_n={32,64,128}`、`num_warps={4,8}`、`num_splits={auto,1,4,8}`；
+- `triton_paged`: 72 个点，`block_n={32,64,128}`、`num_warps={4,8}`、`length_pattern={uniform,descending}`、`paged_layout={contiguous,shuffled,interleaved}`；
+- 两个 manifest 均无 `profiler_error`，`measured_achieved_bandwidth_gbps` 全部有效。
+
+全矩阵最优点：
+
+| backend | 场景 | 最优配置 | latency_ms | measured BW | DRAM throughput | occupancy | regs/thread |
+|---|---|---|---:|---:|---:|---:|---:|
+| triton_fused | s2048/d128 | `block_n=128, num_warps=4, split=4` | 0.2555 | 918.9 GB/s | 59.1% | 18.0% | 168 |
+| triton_fused | s4096/d128 | `block_n=128, num_warps=4, split=4` | 0.4856 | 931.6 GB/s | 59.9% | 18.0% | 168 |
+| triton_paged | s2048/d128 uniform | `block_n=128, num_warps=4, contiguous` | 0.2859 | 790.7 GB/s | 50.8% | 15.5% | 168 |
+| triton_paged | s4096/d128 uniform | `block_n=128, num_warps=4, contiguous` | 0.5604 | 789.4 GB/s | 50.8% | 15.5% | 168 |
+| triton_paged | s2048/d128 descending | `block_n=128, num_warps=4, contiguous` | 0.2770 | 527.7 GB/s | 33.9% | 15.6% | 168 |
+| triton_paged | s4096/d128 descending | `block_n=128, num_warps=4, interleaved` | 0.5289 | 524.0 GB/s | 33.7% | 15.6% | 168 |
+
+关键结论：
+
+- `block_n=128, num_warps=4` 是当前最稳的默认候选。相对同场景最佳 `block_n=64`，fused 提升约 `+16.6%/+17.5%`，paged uniform 提升约 `+16.8%/+15.7%`。
+- `block_n=32` 继续失败。虽然 occupancy 更高、寄存器更低，但相对最佳 `block_n=128` 慢约 `49-67%`，DRAM throughput 明显低，说明小 tile 增加循环/地址/调度开销后得不偿失。
+- `num_warps=8` 也不适合作为默认。即使寄存器较低、occupancy 看起来更高，最佳 `nw8` 仍比 `bn128,nw4` 慢约 `29-49%`。
+- fused 的 Split-K 在 full 矩阵里 `split=4` 对 s2048 和 s4096 都最优；s2048 的 `split=8` 很接近但略慢，后续默认可先固定 `split=4`，再保留 shape-specific tuning 空间。
+- paged uniform 相比 fused 最优慢约 `+11.9%`(s2048) 和 `+15.4%`(s4096)。这是 paged/block_table 间接访问的当前成本量级。
+- paged locality: s2048 下 `shuffled` 明显变慢，尤其 descending `0.2770 -> 0.3401 ms`；s4096 下三种 layout 接近，说明 locality 损耗更明显出现在较短序列或 cache 更敏感的场景。
+
+更新后的下一步：
+
+1. 把默认实验候选收敛到 `block_n=128, num_warps=4, split=4`，先做 correctness + 单点复跑确认稳定性。
+2. 对 fused 最优点和 paged 最优/最差 locality 点跑 source-line / instruction attribution，重点看地址计算、dequant 指令、long scoreboard。
+3. 若继续优化寄存器，不再优先靠 `block_n` 或 `num_warps` 降寄存器，而是缩短 q/acc/softmax 状态和 offset/qparam 地址张量生命周期，并检查 spill。
+4. 对 paged 优先优化 block_table/locality 路径；uniform 下目标是缩小相对 fused 的 `12-15%` gap。
+
+**2026-07-15 文档与脚本收口**
+
+根据 full matrix 结果，项目文档从“设计草案 + 多份历史说明”收口为三份主文档：
+
+- 根目录 `README.md`: 唯一项目入口，合并原 `doc/README.MD` 的设计边界、运行命令和当前 A100 结论；
+- `doc/TODO.MD`: 只保留下一阶段任务，不再混入已完成方案；
+- `doc/optimization-log.md`: 保留完整实验历史、数据和结论。
+
+删除的过时文档/脚本：
+
+- `doc/README.MD`: 内容已合并进根 README；
+- `doc/split-k-plan.md`: Split-K 已实现并通过矩阵 profiling 验证，历史方案由本日志承接；
+- `doc/deep_engineering_project.svg`: 早期技术地图，当前 README/TODO 已替代其项目导航作用；
+- `benchmarks/ab_split_k.sh`: 单独 Split-K A/B 已被 `scripts/profile_matrix.py` 覆盖；
+- `scripts/profile_roofline.py`: 静态 roofline 草图不再是当前 profiling 主流程。
+
+保留的脚本边界：
+
+- `scripts/profile_matrix.py`: 运行 fused/paged profiling 矩阵；
+- `scripts/analyze_results.py`: 汇总单点 JSON 并画图；
+- `scripts/profile_report.py`: 单个 JSON 的 Markdown report；
+- `scripts/backfill_ncu.py`: 保留为手动 `.ncu-rep`/CSV 回填 fallback，虽然常规路径优先使用 `microbench.py --profile-ncu`。
+
 ---
 
 ## 附:已修复的基础设施 bug
