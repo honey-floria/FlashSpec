@@ -4,18 +4,18 @@
 - device: `NVIDIA A100-SXM4-40GB`
 - shape: batch=16, heads=32, seq_len=2048, head_dim=128
 - timing_method: `cuda_event`
-- latency_ms: `0.29737`
-- latency_p50_ms: `0.29737`
-- latency_p90_ms: `0.297615`
-- latency_p99_ms: `0.297682`
-- tokens_per_second: `53805.1`
+- latency_ms: `0.370156`
+- latency_p50_ms: `0.370156`
+- latency_p90_ms: `0.370854`
+- latency_p99_ms: `0.370988`
+- tokens_per_second: `43225.1`
 - materializes_dense_kv: `False`
 - raw_latency_samples: `20`
 
 ## Nsight Compute Command
 
 ```bash
-ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed --kernel-name regex:"fused_dequant_attention_kernel" --launch-count 5 --target-processes all --export results/ncu_triton_fused_b16_h32_s2048_d128 --force-overwrite --csv python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 1 --device cuda --dtype float16 --json
+ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed --kernel-name regex:"fused_dequant_attention|combine_splits" --launch-count 5 --target-processes all --export results/ncu_triton_fused_b16_h32_s2048_d128 --force-overwrite --csv python benchmarks/microbench.py --backend triton_fused --batch 16 --heads 32 --seq-len 2048 --head-dim 128 --block-size 16 --iters 50 --warmup 10 --repeats 1 --device cuda --dtype float16 --json
 ```
 
 ## Latency Breakdown Map
@@ -32,10 +32,10 @@ ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum,gpu__time_duration.sum,
 
 ## Measured Profiler Fields
 
-- measured_kernel_latency_ms: `0.29737`
-- measured_dram_bytes: `not_collected`
-- measured_achieved_bandwidth_gbps: `not_collected`
-- measured_occupancy_pct: `not_collected`
-- measured_sm_utilization_pct: `not_collected`
+- measured_kernel_latency_ms: `0.370156`
+- measured_dram_bytes: `8.55102e+08`
+- measured_achieved_bandwidth_gbps: `775.403`
+- measured_occupancy_pct: `23.475`
+- measured_sm_utilization_pct: `46.3203`
 
 这些 measured profiler 字段需要用上面的 Nsight Compute 命令采集后回填；microbench 默认只负责生成可复现命令和 CUDA event latency。
