@@ -99,7 +99,7 @@ def write_summary_csv(rows: list[dict], out: Path) -> None:
     cols = [
         "_file", "backend", "seq_len", "head_dim", "block_size", "block_n", "num_warps",
         "num_splits", "env_flashspec_num_splits", "env_flashspec_block_n", "env_flashspec_num_warps",
-        "length_pattern", "effective_min_seq_len", "effective_max_seq_len",
+        "length_pattern", "passes_lengths_to_attention", "effective_min_seq_len", "effective_max_seq_len",
         "paged_layout", "paged_layout_seed",
         "latency_ms", "latency_std_ms", "tokens_per_second",
         "compression_ratio", "effective_quant_kv_bandwidth_gbps",

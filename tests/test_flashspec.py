@@ -234,6 +234,7 @@ class FlashSpecTest(unittest.TestCase):
             "env_flashspec_num_warps",
             "num_warps",
             "length_pattern",
+            "passes_lengths_to_attention",
             "effective_lengths",
             "effective_min_seq_len",
             "effective_max_seq_len",
@@ -253,6 +254,7 @@ class FlashSpecTest(unittest.TestCase):
         self.assertIsNone(data["env_flashspec_block_n"])
         self.assertIsNone(data["env_flashspec_num_warps"])
         self.assertEqual(data["length_pattern"], "uniform")
+        self.assertFalse(data["passes_lengths_to_attention"])
         self.assertEqual(data["effective_lengths"], [4])
         self.assertEqual(data["paged_layout"], "contiguous")
 

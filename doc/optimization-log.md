@@ -226,6 +226,28 @@ python scripts/profile_matrix.py --backend triton_paged \
 - 对 Kernel 2 看 `shuffled/interleaved` 是否明显拉高 latency 或 long scoreboard stall；
 - 如果 source-line 显示地址计算/反量化指令占比过高，再进入代码级寄存器生命周期和地址张量优化。
 
+**2026-07-15 上传结果初读（`results/colab_kernels/*.json`）**
+
+当前上传的是单点 shape + Split-K A/B + `block_n` A/B，还不是 `scripts/profile_matrix.py` 生成的完整矩阵：
+
+- 没有发现 `results/profile_matrix/*manifest.csv`；
+- `results/colab_kernels/analysis/summary.csv` 已重新生成；
+- dense baseline 的 NCU CSV 解析失败，但 Triton fused/paged 的 profiler 字段完整。
+
+需要注意：这批 JSON 来自一个中间版本，当 `length_pattern=uniform` 时也会把 `lengths` 传给 Kernel 1，导致 `triton_fused` 编译为 `has_lengths=True` 路径，和旧固定长度基线不完全可比。代码已修正为：默认 uniform 不传 `lengths`，只有显式 `--lengths` 或 variable pattern 才测试 mask 分支。下面数字只能作为方向判断，正式表需要修正后复跑。
+
+方向性观察：
+
+| 实验 | 结果 |
+|---|---|
+| Split-K s2048/d128 | event latency `0.3214 -> 0.3039 ms`，约 `+5.7%` |
+| Split-K s4096/d128 | event latency `0.6284 -> 0.5639 ms`，约 `+11.4%` |
+| block_n 64->32 s2048/d128 | `0.3442 -> 0.4534 ms`，约 `-24.1%`；DRAM throughput `45.5% -> 31.7%` |
+| block_n 64->32 s4096/d128 | `0.6279 -> 0.8947 ms`，约 `-29.8%`；DRAM throughput `45.3% -> 31.4%` |
+| triton_paged vs triton_fused | paged 在 d128/s2048 接近 fused（`0.3706 vs 0.3666 ms`），但多数 shape 仍慢，d64 差距更大 |
+
+临时结论不变：`block_n=32` 不能作为默认；Split-K 值得保留并继续按 `num_splits` 矩阵找最优；Kernel 2 下一步必须跑 `paged_layout={contiguous,shuffled,interleaved}` 和 variable length 矩阵，否则无法判断 block_table locality 是否是主要损耗。
+
 ---
 
 ## 附:已修复的基础设施 bug

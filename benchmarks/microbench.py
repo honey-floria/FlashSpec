@@ -462,10 +462,13 @@ def main() -> None:
     k = torch.randn((args.batch, args.heads, args.seq_len, args.head_dim), generator=generator, device=device, dtype=dtype)
     v = torch.randn((args.batch, args.heads, args.seq_len, args.head_dim), generator=generator, device=device, dtype=dtype)
     lengths = _resolve_lengths(args, device)
+    # 默认 uniform case 不向 Kernel 1/dense 传 lengths，保持与原始固定长度
+    # benchmark 的编译路径一致；只有显式 --lengths 或 variable pattern 才测试 mask 分支。
+    attention_lengths = None if args.length_pattern == "uniform" and not args.lengths else lengths
 
     if args.backend == "dense":
         def run() -> torch.Tensor:
-            return reference_attention(q, k, v, lengths=lengths)
+            return reference_attention(q, k, v, lengths=attention_lengths)
 
         stats = {
             "dense_kv_bytes": float(2 * k.numel() * k.element_size()),
@@ -478,9 +481,9 @@ def main() -> None:
         vq = quantize_int8_per_block(v, block_size=args.block_size)
 
         def run() -> torch.Tensor:
-            return fused_dequant_attention(q, kq, vq, lengths=lengths)
+            return fused_dequant_attention(q, kq, vq, lengths=attention_lengths)
 
-        _, stats = fused_dequant_attention(q, kq, vq, lengths=lengths, return_stats=True)
+        _, stats = fused_dequant_attention(q, kq, vq, lengths=attention_lengths, return_stats=True)
     elif args.backend == "triton_fused":
         if not HAS_TRITON:
             raise RuntimeError("triton_fused backend 需要安装 Triton：python -m pip install -e \".[triton]\"")
@@ -491,15 +494,15 @@ def main() -> None:
         vq = quantize_int8_per_block(v, block_size=args.block_size)
 
         def run() -> torch.Tensor:
-            return fused_dequant_attention_triton(q, kq, vq, lengths=lengths)
+            return fused_dequant_attention_triton(q, kq, vq, lengths=attention_lengths)
 
-        _, stats = fused_dequant_attention_triton(q, kq, vq, lengths=lengths, return_stats=True)
+        _, stats = fused_dequant_attention_triton(q, kq, vq, lengths=attention_lengths, return_stats=True)
     elif args.backend == "paged":
         cache = PagedKVCache.from_dense(
             k,
             v,
             block_size=args.block_size,
-            lengths=lengths,
+            lengths=attention_lengths,
             block_table_pattern=args.paged_layout,
             layout_seed=args.layout_seed,
         )
@@ -518,7 +521,7 @@ def main() -> None:
             k,
             v,
             block_size=args.block_size,
-            lengths=lengths,
+            lengths=attention_lengths,
             block_table_pattern=args.paged_layout,
             layout_seed=args.layout_seed,
         )
@@ -557,6 +560,7 @@ def main() -> None:
         "block_size": args.block_size,
         "seed": args.seed,
         "length_pattern": args.length_pattern,
+        "passes_lengths_to_attention": attention_lengths is not None,
         "effective_lengths": [int(x) for x in lengths.detach().cpu().tolist()],
         "effective_min_seq_len": int(lengths.min().item()),
         "effective_max_seq_len": int(lengths.max().item()),
