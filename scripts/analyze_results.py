@@ -1,3 +1,9 @@
+"""把 results 目录里的单点 JSON 结果整理成图和汇总 CSV。
+
+这个脚本面向的是“已经跑完的 benchmark 数据”，不是 profiling 采集本身。
+它的职责是把零散 JSON 汇总成可比较的图表和 summary.csv，便于快速看趋势。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +20,8 @@ import matplotlib.pyplot as plt
 
 def load_all(results_dir: Path) -> list[dict]:
     """读取 results 目录下全部 microbench JSON。"""
+
+    # 这里只扫描顶层 `*.json`，避免把分析脚本自己输出的中间文件也混进去。
     rows = []
     for path in sorted(glob.glob(str(results_dir / "*.json"))):
         data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -23,6 +31,7 @@ def load_all(results_dir: Path) -> list[dict]:
 
 
 def parse_args() -> argparse.Namespace:
+    # `results-dir` 通常指向一个已经收敛的结果目录；`output-dir` 存放分析图和 summary。
     parser = argparse.ArgumentParser(description="Aggregate FlashSpec results into plots")
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
     parser.add_argument("--output-dir", type=Path, default=Path("results/analysis"))
@@ -31,6 +40,8 @@ def parse_args() -> argparse.Namespace:
 
 def plot_backend_comparison(rows: list[dict], out: Path) -> None:
     """基准 shape (s2048/d128) 下各后端延迟对比柱状图。"""
+
+    # 只选基准 shape，避免把不同序列长度混在一张图里失去可比性。
     ref = [r for r in rows if r.get("seq_len") == 2048 and r.get("head_dim") == 128
            and "_compare" not in r["_file"]]
     ref.sort(key=lambda r: r["latency_ms"])
@@ -54,6 +65,8 @@ def plot_backend_comparison(rows: list[dict], out: Path) -> None:
 
 def plot_triton_scaling(rows: list[dict], out: Path) -> None:
     """Triton 后端随 seq_len 的延迟与带宽 scaling。"""
+
+    # 左图看 latency，右图看带宽；两者放在一起更容易看出“慢是因为哪一类资源没打满”。
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
     for backend in ("triton_fused", "triton_paged"):
         for hd in (64, 128):
@@ -72,6 +85,7 @@ def plot_triton_scaling(rows: list[dict], out: Path) -> None:
                     bw.append(m)
                     measured_any = True
                 else:
+                    # 没有 NCU 回填时，回退到估算带宽；图上会用 [est] 标明这是估算值。
                     bw.append(r["effective_quant_kv_bandwidth_gbps"])
             marker = "o-" if backend == "triton_fused" else "s--"
             suffix = " [measured]" if measured_any else " [est]"
@@ -96,6 +110,8 @@ def plot_triton_scaling(rows: list[dict], out: Path) -> None:
 
 def write_summary_csv(rows: list[dict], out: Path) -> None:
     """把关键指标导出成 CSV 便于二次分析。"""
+
+    # 这里的列顺序是固定的，目的是让后续 diff / spreadsheet / pandas 都能稳定消费。
     cols = [
         "_file", "backend", "seq_len", "head_dim", "block_size", "block_n", "num_warps",
         "num_splits", "env_flashspec_num_splits", "env_flashspec_block_n", "env_flashspec_num_warps",
@@ -119,6 +135,7 @@ def write_summary_csv(rows: list[dict], out: Path) -> None:
 
 
 def main() -> None:
+    # 扫描结果 -> 画图 -> 导出 summary.csv，保持整个分析流程可重复、无交互。
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = load_all(args.results_dir)

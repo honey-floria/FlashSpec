@@ -451,6 +451,37 @@ Paged locality / variable length 观察：
 - paged path 的下一步应优先优化 block table / 地址计算 / request lifecycle，而不是继续调 `block_n` 或 `num_warps`。
 - s4096 fused/paged best-point `.ncu-rep` 已导出到 `results/ncu_source_attribution_export/`，并已纳入 `results/profile_matrix_report.md`。当前证据支持继续沿用 s2048 的归因结论：主线不是提高 occupancy，而是提高有效 DRAM BW / issue efficiency，并减少 paged 地址路径和等待。
 
+**2026-07-16 P1 Serving 模拟可信化**
+
+这次不是 kernel 性能优化，而是把 serving benchmark 做成更接近真实请求生命周期的模拟器，避免 `e2e_serving.py` 只停留在“固定长度 smoke test + 随机 tensor”的层面。
+
+| 项目 | 做法 | 结果 | 原因分析 / 原理 | 当前结论 |
+|---|---|---|---|---|
+| PagedKVAllocator | 新增固定容量 physical blocks、free list、`request_id -> logical blocks -> physical blocks` 映射 | serving 侧可以表达 request arrival / finish / reuse | 真实 serving 的核心不是单次 attention，而是请求生命周期、block 复用和尾部碎片；没有 allocator 就无法统计 utilization / fragmentation | 作为 serving 模拟主结构保留 |
+| request lifecycle | `add_request / append_request / release_request / to_cache` 按 batch 维驱动 | request 完成后 block 可被后续 request 复用，CPU correctness 通过 | 这对应实际服务端的 KV cache 回收语义；只有生命周期完整，benchmark 才能反映真实 batch 波动 | 保留 |
+| serving benchmark | `benchmarks/e2e_serving.py` 支持 `--prompt-lens`、`--prompt-length-distribution`、`--request-life-steps`、`--allocator-blocks` | JSON 顶层新增 `prefill_ms / arrival_prefill_ms / total_prefill_ms / ttft_ms / tpot_ms / tokens_per_second / block_utilization / fragmentation` | prefill、first token、decode loop 是 serving 里应分开的阶段；把它们拆开后，TTFT/TPOT 才有解释力 | 作为标准 serving benchmark 留下 |
+| schema 测试 | 为 `e2e_serving.py --json` 增加 smoke test | 确认 CPU 也可运行，不依赖 CUDA；字段和 lifecycle 行为稳定 | benchmark 输出如果不做 schema 约束，很容易在后续改动中悄悄丢字段或把生命周期逻辑改坏 | 保留 |
+
+**A100 实测结果（`results/colab_serving/*.json`）**
+
+| case | prompt_lens | lifecycle | ttft_ms | tpot_ms | tok/s | block_utilization | fragmentation | 说明 |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| smoke | 64,128 | `request_life_steps=2` | 195.68 | 9.60 | 416.6 | 1.0000 | 0.0000 | 小规模 CUDA smoke，验证 schema 和 lifecycle |
+| bimodal_lifecycle | 512,1024,2048 | `request_life_steps=16` | 1137.17 | 18.61 | 859.6 | 1.0000 | 0.0000 | 整 block 对齐，确认 allocator reuse 正常 |
+| random_fragmentation | 513,1000,2047 | `request_life_steps=7` | 1119.64 | 19.46 | 822.4 | 0.9916 | 0.0084 | 非整 block 尾部浪费被正确统计为 padding / fragmentation |
+
+**原因分析**
+
+- 之前的 serving 路径本质上是“固定 batch + 固定 prompt_len + 随机 tensor”的 smoke test，不能回答 request 到达、结束、block 复用、碎片和 batch 波动这些问题。
+- 旧 `PagedKVCache.append()` 仍会在物理 block store 上整体重量化，不足以表达真正的 allocator 行为；这次新增 allocator 后，只更新目标 request 的最后一个 block，跨 block 边界才分配新 block。
+- `fragmentation` 不是性能指标本身，而是说明当前 batch 的有效 token 和已分配 token 容量之间的差距；当 prompt 长度不是 block 对齐时，这个值应当大于 0，并且能和 `padding_waste` 对上。
+
+**结论**
+
+- serving benchmark 现在已经能稳定表达 request lifecycle、prefill/decode 分离、block 复用和碎片统计。
+- A100 上的三组结果都能自洽：字段完整、生命周期正确、`padding_waste` 与 `fragmentation` 数学一致。
+- 当前 serving 结果仍然使用随机 tensor，不代表真实模型 KV 分布；下一步如果要继续做 serving 优化，应补真实模型 KV sample workflow，再讨论实际线上分布。
+
 **2026-07-15 文档与脚本收口**
 
 根据 full matrix 结果，项目文档从“设计草案 + 多份历史说明”收口为三份主文档：

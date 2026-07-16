@@ -1,3 +1,10 @@
+"""运行 FlashSpec kernel profiling 矩阵，并把每个点的 JSON 结果整理成 manifest。
+
+这个脚本是矩阵 profiling 的主入口：它只负责枚举参数组合、设置环境变量、
+调用 `benchmarks/microbench.py`，再把结果写成统一的 CSV，方便后续分析脚本和
+Markdown 报告复用。它不直接解释性能好坏，只负责把数据跑全、跑稳、跑可追溯。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,14 +22,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _ints(value: str) -> list[int]:
+    # 命令行参数统一用逗号分隔，这里转成整数列表，方便后面用 product 展开矩阵。
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def _strings(value: str) -> list[str]:
+    # 同样的解析方式也适用于字符串枚举，比如 layout / length pattern。
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def parse_args() -> argparse.Namespace:
+    # 所有 matrix 参数都在这里集中声明，默认值尽量贴近当前文档里的标准实验配置。
     parser = argparse.ArgumentParser(description="Run FlashSpec kernel profiling matrices")
     parser.add_argument("--backend", choices=["triton_fused", "triton_paged"], required=True)
     parser.add_argument("--seq-lens", default="512,2048,4096")
@@ -57,6 +67,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _variant_iter(args: argparse.Namespace):
+    # 用 product 把每个维度的候选值展开成完整矩阵。
+    # fused 和 paged 的参数空间不同，所以这里按 backend 分两条展开逻辑。
     seq_lens = _ints(args.seq_lens)
     head_dims = _ints(args.head_dims)
     block_ns = _ints(args.block_ns)
@@ -93,6 +105,7 @@ def _variant_iter(args: argparse.Namespace):
 
 
 def _file_name(args: argparse.Namespace, v: dict[str, object]) -> str:
+    # 结果文件名把关键 knob 编进文件名，方便在 results 目录里直接按名字识别配置。
     parts = [
         args.backend,
         f"s{v['seq_len']}",
@@ -109,6 +122,8 @@ def _file_name(args: argparse.Namespace, v: dict[str, object]) -> str:
 
 
 def _command(args: argparse.Namespace, v: dict[str, object], output: Path) -> list[str]:
+    # 这里拼的是 microbench 命令，而不是直接在本脚本里重写 benchmark 逻辑。
+    # 这样 profile_matrix 只是 orchestration 层，单点逻辑仍由 microbench 维护。
     cmd = [
         sys.executable,
         str(ROOT / "benchmarks" / "microbench.py"),
@@ -141,6 +156,7 @@ def _command(args: argparse.Namespace, v: dict[str, object], output: Path) -> li
 
 
 def _env(args: argparse.Namespace, v: dict[str, object]) -> dict[str, str]:
+    # matrix 的关键 knob 通过环境变量传给 Triton kernel，避免把它们硬编码在代码里。
     env = os.environ.copy()
     env["FLASHSPEC_BLOCK_N"] = str(v["block_n"])
     env["FLASHSPEC_NUM_WARPS"] = str(v["num_warps"])
@@ -152,6 +168,8 @@ def _env(args: argparse.Namespace, v: dict[str, object]) -> dict[str, str]:
 
 
 def _manifest_row(path: Path, v: dict[str, object], data: dict[str, object]) -> dict[str, object]:
+    # manifest 的职责是把“矩阵参数”和“实测/回填结果”放在一张表里。
+    # 后续 analyze_matrix.py 只需要读这个 CSV，就能生成报告。
     return {
         "file": str(path),
         "backend": data.get("backend"),
@@ -178,6 +196,7 @@ def _manifest_row(path: Path, v: dict[str, object], data: dict[str, object]) -> 
 
 
 def main() -> None:
+    # 主流程很直：解析参数 -> 枚举矩阵 -> 跑每个点 -> 回填 JSON -> 写 manifest。
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary = args.summary or (args.output_dir / f"{args.backend}_manifest.csv")
@@ -187,12 +206,14 @@ def main() -> None:
         output = args.output_dir / _file_name(args, variant)
         cmd = _command(args, variant, output)
         env = _env(args, variant)
+        # 把关键 knob 展示出来，日志里一眼就能看到当前点实际跑的是哪组环境变量。
         env_prefix = " ".join(
             f"{k}={env[k]}" for k in ("FLASHSPEC_BLOCK_N", "FLASHSPEC_NUM_WARPS", "FLASHSPEC_NUM_SPLITS") if k in env
         )
         print(f">> {env_prefix} {shlex.join(cmd)}")
         if args.dry_run:
             continue
+        # 真实执行时把 stdout/stderr 收起来，只把失败信息显式抛给调用者。
         proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
         if proc.returncode != 0:
             raise SystemExit(f"matrix point failed with exit code {proc.returncode}\n{proc.stderr}")
@@ -200,6 +221,7 @@ def main() -> None:
         rows.append(_manifest_row(output, variant, data))
 
     if rows:
+        # 只有真正跑出结果时才写 summary CSV，避免空目录留下误导性的空文件。
         summary.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = list(rows[0].keys())
         with summary.open("w", newline="", encoding="utf-8") as handle:

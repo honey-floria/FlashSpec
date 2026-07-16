@@ -1,3 +1,10 @@
+"""把 `results/profile_matrix` 和 source attribution 导出整理成稳定的 Markdown 报告。
+
+这个脚本不做任何 profiling，只负责把 matrix manifest、NCU 导出 CSV 和关键派生
+指标汇总成一份可读报告。这样可以避免手工翻多个目录，也方便比较不同 backend、
+不同 shape 和不同参数组的平均表现。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +16,7 @@ from typing import Iterable
 
 
 def parse_args() -> argparse.Namespace:
+    # 这里的默认目录都指向仓库内的正式结果目录，便于在 Colab 或本地直接复用。
     parser = argparse.ArgumentParser(description="Generate a stable FlashSpec profiling matrix report")
     parser.add_argument("--matrix-dir", type=Path, default=Path("results/profile_matrix"))
     parser.add_argument("--source-dir", type=Path, default=Path("results/ncu_source_attribution_export"))
@@ -18,6 +26,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _float(value: object) -> float | None:
+    # matrix manifest 里的字段来自 CSV，可能是空字符串、带逗号的数字或普通文本。
+    # 这里统一转成 float，失败则返回 None，避免后面排序/聚合时反复写容错逻辑。
     if value is None:
         return None
     text = str(value).strip().replace(",", "")
@@ -30,11 +40,14 @@ def _float(value: object) -> float | None:
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
+    # 所有输入都按 UTF-8 CSV 读取；脚本不依赖 pandas，便于在最小环境下运行。
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 
 def _manifest_rows(matrix_dir: Path) -> list[dict[str, str]]:
+    # 遍历所有 *_manifest.csv，把不同矩阵的行合并成一个大表。
+    # 每行额外写入 `_manifest`，便于报告里追溯到具体清单文件。
     rows: list[dict[str, str]] = []
     for path in sorted(matrix_dir.glob("**/*_manifest.csv")):
         for row in _read_csv(path):
@@ -44,6 +57,7 @@ def _manifest_rows(matrix_dir: Path) -> list[dict[str, str]]:
 
 
 def _group(rows: Iterable[dict[str, str]], keys: tuple[str, ...]) -> dict[tuple[str, ...], list[dict[str, str]]]:
+    # 按一组 key 聚合成 defaultdict(list)，后面既能算平均值，也能按组合输出表格。
     grouped: dict[tuple[str, ...], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         grouped[tuple(row.get(key, "") for key in keys)].append(row)
@@ -51,18 +65,21 @@ def _group(rows: Iterable[dict[str, str]], keys: tuple[str, ...]) -> dict[tuple[
 
 
 def _avg(rows: list[dict[str, str]], field: str) -> float | None:
+    # 某些行可能缺 profiler 字段或是空值，所以先过滤 None 再取均值。
     values = [_float(row.get(field)) for row in rows]
     values = [value for value in values if value is not None]
     return mean(values) if values else None
 
 
 def _fmt(value: float | None, digits: int = 4) -> str:
+    # 报告里统一用固定小数位，避免不同机器/不同 Python 版本产生过长浮点串。
     if value is None:
         return "n/a"
     return f"{value:.{digits}f}"
 
 
 def _top_table(rows: list[dict[str, str]], top_k: int) -> list[str]:
+    # 每个 shape 先按 latency 排序，输出最优的前 K 个点，方便快速定位默认候选。
     lines = [
         "| backend | seq | head_dim | latency ms | block_n | warps | splits | len pattern | layout | BW GB/s | DRAM % | occ % | regs |",
         "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|",
@@ -90,6 +107,7 @@ def _top_table(rows: list[dict[str, str]], top_k: int) -> list[str]:
 
 
 def _group_table(rows: list[dict[str, str]], keys: tuple[str, ...]) -> list[str]:
+    # 对同一 backend 下的参数维度做分组平均，回答“某个 knob 整体上是好还是坏”。
     header = " | ".join(keys)
     lines = [
         f"| {header} | points | avg latency ms | avg BW GB/s | avg DRAM % | avg occ % | avg regs |",
@@ -112,6 +130,8 @@ def _group_table(rows: list[dict[str, str]], keys: tuple[str, ...]) -> list[str]
 
 
 def _source_rows(source_dir: Path) -> list[dict[str, object]]:
+    # source attribution 导出的 CSV 里每个文件对应一个 case。
+    # 这里保留主 kernel，跳过 combine kernel，因为 combine 只是配套收尾，容易稀释主 kernel 的特征。
     rows: list[dict[str, object]] = []
     for path in sorted(source_dir.glob("*.csv")):
         for row in _read_csv(path):
@@ -143,6 +163,7 @@ def _source_rows(source_dir: Path) -> list[dict[str, object]]:
 
 
 def _pct(row: dict[str, str], sample: float, field: str) -> float | None:
+    # Nsight Compute 的某些 counters 是 sample count，需要除以总 sample 再换算成百分比。
     if sample <= 0:
         return None
     value = _float(row.get(field)) or 0.0
@@ -150,6 +171,7 @@ def _pct(row: dict[str, str], sample: float, field: str) -> float | None:
 
 
 def _source_table(rows: list[dict[str, object]]) -> list[str]:
+    # 如果没有导出的 source attribution CSV，就给出显式提示，而不是生成空表。
     if not rows:
         return ["No source attribution CSV files found."]
     lines = [
@@ -176,6 +198,10 @@ def _source_table(rows: list[dict[str, object]]) -> list[str]:
 
 
 def main() -> None:
+    # 1) 收集 matrix manifest
+    # 2) 按 shape / backend / knob 组织表格
+    # 3) 汇总 source attribution CSV
+    # 4) 输出稳定 Markdown
     args = parse_args()
     rows = _manifest_rows(args.matrix_dir)
     if not rows:

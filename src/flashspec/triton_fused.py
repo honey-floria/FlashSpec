@@ -304,7 +304,7 @@ def _validate_triton_fused_inputs(
     - q 必须是 [batch, heads, head_dim]；
     - 量化 K/V 必须来自 [batch, heads, seq_len, head_dim]；
     - 所有输入必须在同一个 CUDA 设备；
-    - head_dim 当前限制为不超过 256，覆盖 TODO 中要求的 64/128。
+    - head_dim 当前限制为不超过 256，覆盖 TODO.svg 中要求的 64/128。
     """
 
     if q.ndim != 3:

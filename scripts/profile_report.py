@@ -8,6 +8,7 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     """解析 profiling report 命令行参数。"""
 
+    # 这个脚本只接受一个 microbench JSON 输入，再把它渲染成 Markdown 报告。
     parser = argparse.ArgumentParser(description="Summarize FlashSpec benchmark profiling fields")
     parser.add_argument("input", type=Path, help="microbench JSON output")
     parser.add_argument("--output", type=Path, default=Path("results/profile_report.md"))
@@ -21,6 +22,7 @@ def _format_metric(value: object) -> str:
     float 保留 6 位有效数字，避免报告里出现过长的小数。
     """
 
+    # 报告不关心 Python 原生类型，只关心输出是否稳定、是否便于人读。
     if value is None:
         return "not_collected"
     if isinstance(value, float):
@@ -40,6 +42,7 @@ def main() -> None:
     breakdown = data.get("latency_breakdown", [])
     raw_latency = data.get("raw_latency_ms", [])
     lines = [
+        # 把最重要的实验上下文放在开头，方便复制到文档或 issue 中。
         "# FlashSpec Profiling Report",
         "",
         f"- backend: `{data.get('backend')}`",
@@ -93,6 +96,7 @@ def main() -> None:
             "",
             "## Measured Profiler Fields",
             "",
+            # 这些字段只有在跑过 ncu 回填之后才会出现；没采集到时会显示 not_collected。
             f"- measured_kernel_latency_ms: `{_format_metric(data.get('measured_kernel_latency_ms'))}`",
             f"- measured_dram_bytes: `{_format_metric(data.get('measured_dram_bytes'))}`",
             f"- measured_achieved_bandwidth_gbps: `{_format_metric(data.get('measured_achieved_bandwidth_gbps'))}`",

@@ -183,9 +183,62 @@ source attribution 显示 paged 相对 fused 的主要 gap 是较低 DRAM BW / i
 - [ ] 每个 kernel patch 都有明确的 profiling 假设、命令、结果和结论。
 - [ ] `optimization-log.md` 继续按“动机 -> 做法 -> 结果 -> 原因分析 -> 结论”追加。
 
+### 11. Kernel 3: tree-attn / speculative decode
+
+Kernel 3 目标是实现 speculative decoding 的 tree verify kernel：在 quant/paged KV 上并行验证 draft tree，把 causal mask 改成 tree mask，并支持树状 KV 读取。它是可选 bonus，但如果要做，就按“先正确、再可测、再提速”的顺序推进。
+
+- [ ] 明确 Kernel 3 的输入/输出约定：
+  - 输入：`q`、paged/quant KV、tree 拓扑、每个节点的 parent / depth / path token 信息。
+  - 输出：每个 draft 节点的 verify 结果、accept/reject 标记，或每个节点的 attention 输出。
+- [ ] 设计 tree 表示层：
+  - 用 compact node table 表示树节点；
+  - 用 parent pointer / path index 组织祖先链；
+  - 明确哪些节点共享前缀 KV，哪些节点需要独立读取。
+- [ ] 先做 CPU reference：
+  - 把 tree mask 显式展开成 dense mask；
+  - 用现有 reference/paged attention 验证 tree verify 的数学正确性；
+  - 覆盖单链、分叉、不同深度、不同 branch factor。
+- [ ] 复用 Kernel 2 的 paged KV 基础：
+  - 先确认 tree-attn 读取仍基于 block_table / quant block store；
+  - 再在读取阶段加入 path-aware gather，而不是先改 allocator。
+- [ ] 设计 tree mask kernel 逻辑：
+  - 只让当前节点看到祖先路径上的 token；
+  - 屏蔽兄弟分支和未来节点；
+  - 保证和 speculative verify 的 acceptance 语义一致。
+- [ ] 实现树状 gather / verify 主 kernel：
+  - 优先正确实现路径读取；
+  - 再考虑是否能把多节点合并成一个 program；
+  - 关注 branch divergence、地址计算和不规则访存。
+- [ ] 增加必要的辅助数据结构：
+  - node -> path mapping；
+  - path prefix length；
+  - subtree/leaf 采样信息；
+  - 需要时缓存祖先 token 的 block 索引。
+- [ ] 增加 correctness 测试：
+  - 单路径退化时应等价于 Kernel 2；
+  - 两层/三层 tree 的 verify 结果应与 dense tree mask 对齐；
+  - 不同 branch factor 和不同深度都要覆盖；
+  - invalid tree / cycle / orphan node 必须报错。
+- [ ] 增加 benchmark / profiling 入口：
+  - 固定小树形状做 smoke test；
+  - 变 branch factor / depth / leaf count 做 microbench；
+  - 采集 NCU 归因，重点看 address 计算、long scoreboard、global load efficiency。
+- [ ] 明确和现有 Kernel 1/2 的边界：
+  - Kernel 1 仍负责 fused linear decode；
+  - Kernel 2 仍负责 linear paged decode；
+  - Kernel 3 只负责 tree verify 场景，不把 speculative logic 混进通用 decode path。
+
+验收标准：
+
+- [ ] tree-attn 在 CPU reference 上和 dense tree mask 完全对齐。
+- [ ] 单路径退化时，Kernel 3 行为与现有 paged decode 一致。
+- [ ] 分叉 tree 能正确 verify，accept/reject 结果稳定。
+- [ ] benchmark / JSON / profiling 输出能区分 tree depth、branch factor、leaf count。
+- [ ] `optimization-log.md` 能记录 tree-attn 的动机、实现、结果和瓶颈。
+
 ## P2：量化和真实模型评估
 
-### 11. 量化策略对比
+### 12. 量化策略对比
 
 当前是 per-block affine INT8。后续可以比较：
 
@@ -201,7 +254,7 @@ source attribution 显示 paged 相对 fused 的主要 gap 是较低 DRAM BW / i
 - [ ] 输出 attention output error、top-k attention drift、latency 和 storage cost。
 - [ ] 给出推荐默认量化配置。
 
-### 12. 真实模型 KV 分布
+### 13. 真实模型 KV 分布
 
 随机 tensor 只能验证工程流程，不能代表真实 LLM KV 分布。
 
