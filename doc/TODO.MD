@@ -60,7 +60,7 @@
 
 - [x] `summary.csv` 中的关键行和对应 JSON 文件字段一致。
 - [x] README 不再让读者误把旧单点 JSON 当作当前默认结果。
-- [ ] `git status --short` 保持干净。
+- [x] `git status --short` 保持干净。
 
 ## P1：Serving 模拟可信化
 
@@ -68,13 +68,13 @@
 
 当前 `PagedKVCache.append()` 已经不是从完整 dense cache 重建，但仍会反量化并重新量化完整 physical block store。下一步要加入真实 allocator 概念，让 serving loop 能表达 request lifecycle、block 复用和碎片。
 
-- [ ] 新增 allocator 数据结构，管理固定容量 physical blocks。
-- [ ] 实现 block free list。
-- [ ] 实现 `request_id -> logical block list -> physical block` 生命周期管理。
-- [ ] append token 时只定位并更新目标 request 的最后一个 block；跨 block 边界时才分配新 block。
-- [ ] request 完成后释放该 request 占用的 physical blocks。
-- [ ] 支持 batch 内 request 新增和结束。
-- [ ] 输出 allocator stats：
+- [x] 新增 allocator 数据结构，管理固定容量 physical blocks。
+- [x] 实现 block free list。
+- [x] 实现 `request_id -> logical block list -> physical block` 生命周期管理。
+- [x] append token 时只定位并更新目标 request 的最后一个 block；跨 block 边界时才分配新 block。
+- [x] request 完成后释放该 request 占用的 physical blocks。
+- [x] 支持 batch 内 request 新增和结束。
+- [x] 输出 allocator stats：
   - allocated blocks
   - free blocks
   - live requests
@@ -85,32 +85,32 @@
 
 验收标准：
 
-- [ ] decode step 不重建完整 cache。
-- [ ] append 跨 block 边界时只新增必要 block。
-- [ ] request 结束后 block 能被后续 request 复用。
-- [ ] benchmark 能报告 utilization / fragmentation。
-- [ ] CPU correctness 测试覆盖 allocator append、release、reuse。
+- [x] decode step 不重建完整 cache。
+- [x] append 跨 block 边界时只新增必要 block。
+- [x] request 结束后 block 能被后续 request 复用。
+- [x] benchmark 能报告 utilization / fragmentation。
+- [x] CPU correctness 测试覆盖 allocator append、release、reuse。
 
 ### 4. Serving benchmark：prefill/decode 分离
 
-- [ ] `benchmarks/e2e_serving.py` 支持 prompt length list，例如 `--prompt-lens 512,1024,2048`。
-- [ ] 支持 prompt length 分布参数，例如 uniform/random/bimodal。
-- [ ] 明确区分 prefill cache build time 和 decode loop time。
-- [ ] 输出 TTFT、TPOT、tokens/s。
-- [ ] 输出 allocator utilization / fragmentation。
-- [ ] 支持 batch 内不同 request length。
-- [ ] 支持 request arrival / finish 的简单模拟。
+- [x] `benchmarks/e2e_serving.py` 支持 prompt length list，例如 `--prompt-lens 512,1024,2048`。
+- [x] 支持 prompt length 分布参数，例如 uniform/random/bimodal。
+- [x] 明确区分 prefill cache build time 和 decode loop time。
+- [x] 输出 TTFT、TPOT、tokens/s。
+- [x] 输出 allocator utilization / fragmentation。
+- [x] 支持 batch 内不同 request length。
+- [x] 支持 request arrival / finish 的简单模拟。
 
 验收标准：
 
-- [ ] serving benchmark 不再只是一组固定长度请求的 smoke test。
-- [ ] JSON 输出能把 latency 指标和 allocator 指标关联起来。
-- [ ] README 给出一个标准 serving benchmark 命令和示例输出字段。
+- [x] serving benchmark 不再只是一组固定长度请求的 smoke test。
+- [x] JSON 输出能把 latency 指标和 allocator 指标关联起来。
+- [x] README 给出一个标准 serving benchmark 命令和示例输出字段。
 
 ### 5. Serving JSON schema 测试
 
-- [ ] 为 `e2e_serving.py --json` 增加 schema smoke test。
-- [ ] 检查必需字段：
+- [x] 为 `e2e_serving.py --json` 增加 schema smoke test。
+- [x] 检查必需字段：
   - `ttft_ms`
   - `tpot_ms`
   - `tokens_per_second`
@@ -118,7 +118,7 @@
   - `decode_ms`
   - `block_utilization`
   - `fragmentation`
-- [ ] 确认 CPU 环境下测试可运行，不依赖 CUDA。
+- [x] 确认 CPU 环境下测试可运行，不依赖 CUDA。
 
 ## P1：测试和工程质量
 

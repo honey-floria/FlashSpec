@@ -1,11 +1,258 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 
 from .quant import QuantizedTensor, dequantize_int8_per_block, estimate_quantized_bytes, quantize_int8_per_block
+
+
+@dataclass
+class _RequestBlocks:
+    logical_blocks: list[int]
+    length: int
+
+
+class PagedKVAllocator:
+    """固定容量 physical blocks 上的 paged KV allocator。
+
+    该类型用于 serving 模拟：它维护 request 生命周期、free list、block 复用
+    和碎片统计，并能按当前 active request 顺序导出 PagedKVCache 供 attention
+    路径复用。
+    """
+
+    def __init__(
+        self,
+        *,
+        capacity_blocks: int,
+        heads: int,
+        head_dim: int,
+        block_size: int = 16,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        if capacity_blocks <= 0:
+            raise ValueError("capacity_blocks 必须为正数")
+        if heads <= 0 or head_dim <= 0:
+            raise ValueError("heads 和 head_dim 必须为正数")
+        if block_size <= 0:
+            raise ValueError("block_size 必须为正数")
+
+        self.capacity_blocks = int(capacity_blocks)
+        self.heads = int(heads)
+        self.head_dim = int(head_dim)
+        self.block_size = int(block_size)
+        self.device = torch.device(device)
+        self.dtype = dtype
+
+        empty = torch.zeros(
+            (self.capacity_blocks, self.heads, self.block_size, self.head_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.device = empty.device
+        self.k_quant = quantize_int8_per_block(empty, block_size=self.block_size)
+        self.v_quant = quantize_int8_per_block(empty, block_size=self.block_size)
+        self._free_blocks = list(range(self.capacity_blocks))
+        self._requests: dict[int, _RequestBlocks] = {}
+
+    @property
+    def live_request_ids(self) -> list[int]:
+        """当前仍占用 block 的 request id，按插入顺序返回。"""
+
+        return list(self._requests.keys())
+
+    def add_request(
+        self,
+        request_id: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        length: int | None = None,
+    ) -> None:
+        """为新 request 分配 prompt KV blocks。"""
+
+        request_id = int(request_id)
+        if request_id in self._requests:
+            raise ValueError(f"request_id {request_id} 已存在")
+        self._validate_kv(k, v, batch_expected=None)
+        if k.shape[0] != 1:
+            raise ValueError("add_request 只接受单个 request 的 KV，batch 维必须为 1")
+
+        seq_len = int(k.shape[2])
+        effective_length = seq_len if length is None else int(length)
+        if effective_length < 0 or effective_length > seq_len:
+            raise ValueError("length 必须位于 [0, seq_len]")
+
+        blocks_needed = (effective_length + self.block_size - 1) // self.block_size
+        if len(self._free_blocks) < blocks_needed:
+            raise RuntimeError("PagedKVAllocator 可用 physical blocks 不足")
+
+        logical_blocks: list[int] = []
+        for logical_block in range(blocks_needed):
+            physical_idx = self._allocate_block()
+            logical_blocks.append(physical_idx)
+            start = logical_block * self.block_size
+            end = min(start + self.block_size, effective_length)
+            block_k = torch.zeros((1, self.heads, self.block_size, self.head_dim), device=self.device, dtype=torch.float32)
+            block_v = torch.zeros_like(block_k)
+            if end > start:
+                width = end - start
+                block_k[:, :, :width, :] = k[:, :, start:end, :].to(device=self.device, dtype=torch.float32)
+                block_v[:, :, :width, :] = v[:, :, start:end, :].to(device=self.device, dtype=torch.float32)
+            self._write_quantized_block(physical_idx, block_k, block_v)
+
+        self._requests[request_id] = _RequestBlocks(logical_blocks=logical_blocks, length=effective_length)
+
+    def append_request(self, request_id: int, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+        """向一个 request 追加 token，只重新量化被写入的 physical block。"""
+
+        self._validate_kv(k_new, v_new, batch_expected=1)
+        request = self._get_request(request_id)
+        append_tokens = int(k_new.shape[2])
+        if append_tokens <= 0:
+            raise ValueError("追加 token 维度不能为空")
+
+        k_new = k_new.to(device=self.device, dtype=torch.float32)
+        v_new = v_new.to(device=self.device, dtype=torch.float32)
+        touched: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        for token_idx in range(append_tokens):
+            position = request.length + token_idx
+            logical_block = position // self.block_size
+            block_offset = position % self.block_size
+            if logical_block == len(request.logical_blocks):
+                request.logical_blocks.append(self._allocate_block())
+            physical_idx = request.logical_blocks[logical_block]
+            if physical_idx not in touched:
+                touched[physical_idx] = self._dequantized_block(physical_idx)
+            block_k, block_v = touched[physical_idx]
+            block_k[:, :, block_offset, :] = k_new[:, :, token_idx, :]
+            block_v[:, :, block_offset, :] = v_new[:, :, token_idx, :]
+
+        for physical_idx, (block_k, block_v) in touched.items():
+            self._write_quantized_block(physical_idx, block_k, block_v)
+        request.length += append_tokens
+
+    def append_batch(self, request_ids: Sequence[int], k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+        """按 request_ids 顺序为一批 request 追加 KV。"""
+
+        request_ids = [int(request_id) for request_id in request_ids]
+        self._validate_kv(k_new, v_new, batch_expected=len(request_ids))
+        for batch_idx, request_id in enumerate(request_ids):
+            self.append_request(request_id, k_new[batch_idx : batch_idx + 1], v_new[batch_idx : batch_idx + 1])
+
+    def release_request(self, request_id: int) -> None:
+        """释放 request 占用的 physical blocks，使其可被后续 request 复用。"""
+
+        request = self._requests.pop(int(request_id))
+        self._free_blocks.extend(request.logical_blocks)
+        self._free_blocks.sort()
+
+    def to_cache(self, request_ids: Sequence[int] | None = None) -> "PagedKVCache":
+        """按给定 request 顺序导出 PagedKVCache。"""
+
+        ordered_ids = self.live_request_ids if request_ids is None else [int(request_id) for request_id in request_ids]
+        if not ordered_ids:
+            raise ValueError("至少需要一个 live request 才能导出 PagedKVCache")
+
+        requests = [self._get_request(request_id) for request_id in ordered_ids]
+        max_blocks = max((len(request.logical_blocks) for request in requests), default=0)
+        max_blocks = max(1, max_blocks)
+        table = torch.full((len(requests), max_blocks), -1, dtype=torch.int64, device=self.device)
+        lengths = torch.empty((len(requests),), dtype=torch.int64, device=self.device)
+        for batch_idx, request in enumerate(requests):
+            if request.logical_blocks:
+                table[batch_idx, : len(request.logical_blocks)] = torch.tensor(
+                    request.logical_blocks, dtype=torch.int64, device=self.device
+                )
+            lengths[batch_idx] = request.length
+
+        return PagedKVCache(
+            k_quant=self.k_quant,
+            v_quant=self.v_quant,
+            block_table=table,
+            lengths=lengths,
+            block_size=self.block_size,
+            max_seq_len=int(lengths.max().item()),
+        )
+
+    def stats(self) -> Dict[str, float]:
+        """返回 allocator 利用率和碎片指标。"""
+
+        allocated_blocks = self.capacity_blocks - len(self._free_blocks)
+        used_tokens = sum(request.length for request in self._requests.values())
+        allocated_tokens = allocated_blocks * self.block_size
+        capacity_tokens = self.capacity_blocks * self.block_size
+        padding_waste = max(0, allocated_tokens - used_tokens)
+        return {
+            "allocated_blocks": float(allocated_blocks),
+            "free_blocks": float(len(self._free_blocks)),
+            "live_requests": float(len(self._requests)),
+            "used_tokens": float(used_tokens),
+            "capacity_tokens": float(capacity_tokens),
+            "block_utilization": used_tokens / max(1, allocated_tokens),
+            "capacity_utilization": used_tokens / max(1, capacity_tokens),
+            "padding_waste": float(padding_waste),
+            "fragmentation": padding_waste / max(1, allocated_tokens),
+        }
+
+    def _validate_kv(self, k: torch.Tensor, v: torch.Tensor, *, batch_expected: int | None) -> None:
+        if k.ndim != 4 or v.ndim != 4:
+            raise ValueError("KV 必须是 [batch, heads, tokens, head_dim] 形状")
+        if k.shape != v.shape:
+            raise ValueError("K/V 形状必须一致")
+        if batch_expected is not None and k.shape[0] != batch_expected:
+            raise ValueError("KV batch 维必须与 request_ids 对齐")
+        if k.shape[1] != self.heads or k.shape[3] != self.head_dim:
+            raise ValueError("KV heads/head_dim 必须与 allocator 对齐")
+        if k.shape[2] <= 0:
+            raise ValueError("KV token 维不能为空")
+        if k.device != self.device or v.device != self.device:
+            raise ValueError("KV tensor 必须与 allocator 位于同一设备")
+
+    def _get_request(self, request_id: int) -> _RequestBlocks:
+        try:
+            return self._requests[int(request_id)]
+        except KeyError as exc:
+            raise KeyError(f"未知 request_id: {request_id}") from exc
+
+    def _allocate_block(self) -> int:
+        if not self._free_blocks:
+            raise RuntimeError("PagedKVAllocator 可用 physical blocks 不足")
+        return self._free_blocks.pop(0)
+
+    def _dequantized_block(self, physical_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        original_shape = (1, self.heads, self.block_size, self.head_dim)
+        k_quant = QuantizedTensor(
+            values=self.k_quant.values[physical_idx : physical_idx + 1],
+            scale=self.k_quant.scale[physical_idx : physical_idx + 1],
+            zero_point=self.k_quant.zero_point[physical_idx : physical_idx + 1],
+            block_size=self.block_size,
+            original_shape=original_shape,
+        )
+        v_quant = QuantizedTensor(
+            values=self.v_quant.values[physical_idx : physical_idx + 1],
+            scale=self.v_quant.scale[physical_idx : physical_idx + 1],
+            zero_point=self.v_quant.zero_point[physical_idx : physical_idx + 1],
+            block_size=self.block_size,
+            original_shape=original_shape,
+        )
+        return (
+            dequantize_int8_per_block(k_quant, dtype=torch.float32).clone(),
+            dequantize_int8_per_block(v_quant, dtype=torch.float32).clone(),
+        )
+
+    def _write_quantized_block(self, physical_idx: int, k_block: torch.Tensor, v_block: torch.Tensor) -> None:
+        qk = quantize_int8_per_block(k_block, block_size=self.block_size)
+        qv = quantize_int8_per_block(v_block, block_size=self.block_size)
+        self.k_quant.values[physical_idx] = qk.values[0]
+        self.k_quant.scale[physical_idx] = qk.scale[0]
+        self.k_quant.zero_point[physical_idx] = qk.zero_point[0]
+        self.v_quant.values[physical_idx] = qv.values[0]
+        self.v_quant.scale[physical_idx] = qv.scale[0]
+        self.v_quant.zero_point[physical_idx] = qv.zero_point[0]
 
 
 @dataclass(frozen=True)

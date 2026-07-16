@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from flashspec import (
+    PagedKVAllocator,
     PagedKVCache,
     dequantize_int8_per_block,
     fused_dequant_attention,
@@ -225,6 +226,39 @@ class FlashSpecTest(unittest.TestCase):
         actual = paged_quant_attention(q, cache)
         torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-5)
 
+    def test_paged_allocator_append_release_and_reuse(self) -> None:
+        allocator = PagedKVAllocator(capacity_blocks=6, heads=2, head_dim=8, block_size=4)
+        k0 = torch.randn(1, 2, 5, 8)
+        v0 = torch.randn(1, 2, 5, 8)
+        k1 = torch.randn(1, 2, 3, 8)
+        v1 = torch.randn(1, 2, 3, 8)
+        allocator.add_request(10, k0, v0)
+        allocator.add_request(20, k1, v1)
+
+        initial_cache = allocator.to_cache([10, 20])
+        released_physical_block = int(initial_cache.block_table[1, 0].item())
+        self.assertEqual(allocator.stats()["allocated_blocks"], 3.0)
+
+        k_new = torch.randn(1, 2, 4, 8)
+        v_new = torch.randn(1, 2, 4, 8)
+        allocator.append_request(10, k_new, v_new)
+        appended = allocator.to_cache([10])
+        kd, vd = appended.to_dense()
+        expected_k = torch.cat([k0, k_new], dim=2)
+        expected_v = torch.cat([v0, v_new], dim=2)
+        self.assertEqual(tuple(appended.lengths.tolist()), (9,))
+        self.assertEqual(allocator.stats()["allocated_blocks"], 4.0)
+        self.assertLess(float((expected_k - kd).abs().max().item()), 0.08)
+        self.assertLess(float((expected_v - vd).abs().max().item()), 0.08)
+
+        allocator.release_request(20)
+        k2 = torch.randn(1, 2, 1, 8)
+        v2 = torch.randn(1, 2, 1, 8)
+        allocator.add_request(30, k2, v2)
+        reused = allocator.to_cache([30])
+        self.assertEqual(int(reused.block_table[0, 0].item()), released_physical_block)
+        self.assertIn("fragmentation", allocator.stats())
+
     def test_microbench_json_schema_includes_experiment_knobs(self) -> None:
         env = os.environ.copy()
         env.pop("FLASHSPEC_NUM_SPLITS", None)
@@ -287,6 +321,60 @@ class FlashSpecTest(unittest.TestCase):
         self.assertFalse(data["passes_lengths_to_attention"])
         self.assertEqual(data["effective_lengths"], [4])
         self.assertEqual(data["paged_layout"], "contiguous")
+
+    def test_serving_json_schema_includes_latency_and_allocator_fields(self) -> None:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "benchmarks" / "e2e_serving.py"),
+                "--requests",
+                "2",
+                "--prompt-lens",
+                "3,5",
+                "--prompt-length-distribution",
+                "bimodal",
+                "--decode-steps",
+                "3",
+                "--request-life-steps",
+                "2",
+                "--heads",
+                "1",
+                "--head-dim",
+                "8",
+                "--block-size",
+                "4",
+                "--device",
+                "cpu",
+                "--dtype",
+                "float32",
+                "--json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        data = json.loads(proc.stdout)
+        for key in (
+            "ttft_ms",
+            "tpot_ms",
+            "tokens_per_second",
+            "prefill_ms",
+            "decode_ms",
+            "block_utilization",
+            "fragmentation",
+            "allocated_blocks",
+            "free_blocks",
+            "live_requests",
+            "used_tokens",
+            "capacity_tokens",
+            "padding_waste",
+            "arrivals",
+            "finishes",
+            "prompt_lens",
+        ):
+            self.assertIn(key, data)
+        self.assertEqual(data["prompt_lens"], [3, 5])
+        self.assertGreaterEqual(data["finishes"], 2)
 
     @unittest.skipUnless(HAS_TRITON and torch.cuda.is_available(), "requires Triton and CUDA")
     def test_triton_paged_attention_after_append_matches_reconstructed_cache_on_cuda(self) -> None:

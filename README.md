@@ -189,13 +189,20 @@ python benchmarks/sweep.py \
   --output results/a100_sweep.csv
 ```
 
-serving smoke benchmark：
+serving allocator benchmark：
 
 ```bash
 python benchmarks/e2e_serving.py \
-  --requests 32 --prompt-len 1024 --decode-steps 64 \
+  --requests 32 --prompt-lens 512,1024,2048 \
+  --prompt-length-distribution bimodal \
+  --decode-steps 64 --request-life-steps 32 \
   --heads 32 --head-dim 128 --json
 ```
+
+JSON 输出会区分初始 prefill、后续 arrival prefill 和 decode loop，并报告
+allocator 指标，例如 `ttft_ms`、`prefill_ms`、`arrival_prefill_ms`、
+`decode_ms`、`tpot_ms`、`tokens_per_second`、`block_utilization` 和
+`fragmentation`。
 
 ## 项目结构
 
@@ -203,9 +210,9 @@ python benchmarks/e2e_serving.py \
 src/flashspec/
   attention.py       dense / quantized decode attention API
   quant.py           per-block affine INT8 quantization
-  paged.py           paged quant-KV cache and block_table
+  paged.py           paged quant-KV cache, allocator, and block_table
   runtime.py         device / dtype helpers
-  serving.py         minimal decode serving loop
+  serving.py         allocator-backed decode serving loop
   ncu_parse.py       Nsight Compute CSV parser
   triton_fused.py    Kernel 1: fused INT8 KV attention
   triton_paged.py    Kernel 2: paged INT8 KV attention
@@ -215,7 +222,7 @@ src/flashspec/
 benchmarks/
   microbench.py      kernel latency / bandwidth / NCU collection
   sweep.py           batch x seq_len sweep
-  e2e_serving.py     minimal serving benchmark
+  e2e_serving.py     serving allocator benchmark
 
 scripts/
   profile_matrix.py  matrix profiling runner
@@ -230,13 +237,12 @@ doc/
 ## 当前边界
 
 - full matrix 目前主要覆盖 `head_dim=128`、`seq_len={2048,4096}`，还需要补 `head_dim=64`、短序列和更多 request length 分布。
-- `triton_paged` 已有真实 paged KV path，但 serving allocator 仍是简化版，还没有完整 free list、request lifecycle 和 fragmentation 统计。
+- serving benchmark 使用 allocator 模拟 free list、request lifecycle 和 fragmentation，但仍使用随机 tensor，不代表真实模型 KV 分布。
 - `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时；关键 s2048/s4096 点已补 source-line / instruction / memory workload 归因。
 - 随机 tensor 不能代表真实模型 KV 分布；量化误差还需要真实模型 KV sample workflow。
 
 ## 下一步
 
 1. 继续做 attribution-driven kernel patch：减少 shared staging / dequant / softmax 更新里的 MIO、short scoreboard，以及 paged block_table 地址计算。
-2. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
-3. 补真实模型 KV sample workflow，验证量化误差和随机 tensor profiling 的差异。
-4. 补测试矩阵和 CI。
+2. 补真实模型 KV sample workflow，验证量化误差和随机 tensor profiling 的差异。
+3. 补测试矩阵和 CI。
