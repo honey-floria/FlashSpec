@@ -1,7 +1,7 @@
 # FlashSpec Profiling Matrix Report
 
-- matrix_dir: `/content/drive/MyDrive/FlashSpecColab/results/profile_matrix`
-- source_dir: `/content/drive/MyDrive/FlashSpecColab/results/ncu_source_attribution_export`
+- matrix_dir: `results\profile_matrix`
+- source_dir: `results\ncu_source_attribution_export`
 - matrix_points: `120`
 
 ## Top Latency Points
@@ -91,9 +91,11 @@
 
 | case | time us | regs | theo occ % | DRAM GB/s | issue/cycle | eligible warps | long % | short % | wait % | mio % |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| fused_best_s2048_d128_bn128_nw4_split4 | 303.0 | 168 | 18.75 | 901.4 | 0.48 | 0.72 | 13.7 | 12.3 | 24.3 | 9.0 |
-| fused_slow_tile_s2048_d128_bn32_nw4_split4 | 473.8 | 72 | 43.75 | 576.9 | 0.42 | 0.82 | 13.8 | 23.1 | 10.0 | 23.4 |
-| fused_slow_warps_s2048_d128_bn128_nw8_split1 | 447.0 | 120 | 25.00 | 608.2 | 0.36 | 0.62 | 18.1 | 12.7 | 14.0 | 23.0 |
-| fused_slow_warps_s2048_d128_bn128_nw8_split4 | 481.4 | 119 | 25.00 | 567.3 | 0.35 | 0.57 | 30.8 | 11.2 | 13.8 | 16.7 |
-| paged_best_s2048_d128_bn128_nw4_uniform_contiguous | 353.6 | 168 | 18.75 | 768.9 | 0.43 | 0.60 | 15.8 | 11.6 | 26.7 | 8.8 |
-| paged_locality_slow_s2048_d128_bn128_nw4_uniform_shuffled | 355.1 | 168 | 18.75 | 765.7 | 0.43 | 0.59 | 16.8 | 11.4 | 25.8 | 9.0 |
+| fused_best_s2048_d128_bn128_nw4_split4 | 302.8 | 168 | 18.75 | 902.0 | 0.48 | 0.72 | 13.4 | 12.7 | 24.0 | 9.0 |
+| fused_best_s4096_d128_bn128_nw4_split4 | 595.2 | 168 | 18.75 | 911.4 | 0.48 | 0.73 | 12.9 | 12.8 | 25.1 | 9.0 |
+| fused_slow_tile_s2048_d128_bn32_nw4_split4 | 480.5 | 72 | 43.75 | 568.9 | 0.42 | 0.82 | 13.7 | 22.8 | 10.3 | 23.2 |
+| fused_slow_warps_s2048_d128_bn128_nw8_split1 | 450.9 | 120 | 25.00 | 602.9 | 0.36 | 0.62 | 18.2 | 12.3 | 14.0 | 23.8 |
+| fused_slow_warps_s2048_d128_bn128_nw8_split4 | 483.5 | 119 | 25.00 | 564.9 | 0.35 | 0.57 | 30.5 | 11.9 | 13.0 | 17.4 |
+| paged_best_s2048_d128_bn128_nw4_uniform_contiguous | 355.8 | 168 | 18.75 | 764.2 | 0.43 | 0.60 | 15.8 | 11.8 | 26.2 | 9.1 |
+| paged_best_s4096_d128_bn128_nw4_uniform_contiguous | 703.1 | 168 | 18.75 | 769.9 | 0.43 | 0.60 | 15.2 | 11.7 | 26.3 | 9.1 |
+| paged_locality_slow_s2048_d128_bn128_nw4_uniform_shuffled | 360.5 | 168 | 18.75 | 754.2 | 0.43 | 0.59 | 16.7 | 11.5 | 25.7 | 8.8 |

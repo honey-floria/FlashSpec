@@ -29,37 +29,37 @@
   - s4096/d128: `block_n=128, num_warps=4, contiguous`，latency 约 `0.5604 ms`。
 - `block_n=32` 和 `num_warps=8` 仍不适合作为默认：它们提高表面 occupancy，但降低 DRAM throughput 和 issue efficiency。
 - paged uniform 相对 fused 最优仍有约 `12-15%` latency gap，是下一阶段 kernel 层主要优化空间。
-- `results/ncu_source_attribution/` 已包含 s4096 fused/paged best-point `.ncu-rep`；当前本地 `results/ncu_source_attribution_export/` 还缺 s4096 的 CSV/TXT 导出，因此 `profile_matrix_report.md` 的 Source Attribution Summary 暂时只汇总了 s2048 attribution。
-- `results/colab_kernels/analysis/summary.csv` 比部分 `results/colab_kernels/*.json` 更新；单点 JSON 目录存在旧结果混入。后续归档时不要直接把 `colab_kernels/*.json` 全部当成最新默认验收依据。
+- `results/ncu_source_attribution/` 已包含 s4096 fused/paged best-point `.ncu-rep`；`results/ncu_source_attribution_export/` 已补齐 s4096 的 CSV/TXT 导出，`profile_matrix_report.md` 的 Source Attribution Summary 已同时汇总 s2048 和 s4096 attribution。
+- `results/colab_kernels/analysis/summary.csv` 已按当前 `results/colab_kernels/*.json` 重新生成；这些 JSON 是历史单点样本，不是当前默认配置的正式验收依据。
 
 ## P0：结果归档和文档收口
 
 ### 1. 补齐 s4096 source attribution 导出
 
-- [ ] 在有 `ncu` 的环境中导出 s4096 `.ncu-rep`：
+- [x] 在有 `ncu` 的环境中导出 s4096 `.ncu-rep`：
   - `fused_best_s4096_d128_bn128_nw4_split4.ncu-rep`
   - `paged_best_s4096_d128_bn128_nw4_uniform_contiguous.ncu-rep`
-- [ ] 生成对应 CSV/TXT 到 `results/ncu_source_attribution_export/`。
-- [ ] 重新运行 `scripts/analyze_matrix.py`，让 `results/profile_matrix_report.md` 的 Source Attribution Summary 包含 s4096。
-- [ ] 把 s4096 attribution 结论补进 `doc/optimization-log.md`。
+- [x] 生成对应 CSV/TXT 到 `results/ncu_source_attribution_export/`。
+- [x] 重新运行 `scripts/analyze_matrix.py`，让 `results/profile_matrix_report.md` 的 Source Attribution Summary 包含 s4096。
+- [x] 把 s4096 attribution 结论补进 `doc/optimization-log.md`。
 
 验收标准：
 
-- [ ] `results/ncu_source_attribution_export/` 中存在 s4096 fused/paged CSV 和 TXT。
-- [ ] `results/profile_matrix_report.md` Source Attribution Summary 同时包含 s2048 和 s4096。
-- [ ] `optimization-log.md` 明确说明 s4096 是否验证了 s2048 的归因结论。
+- [x] `results/ncu_source_attribution_export/` 中存在 s4096 fused/paged CSV 和 TXT。
+- [x] `results/profile_matrix_report.md` Source Attribution Summary 同时包含 s2048 和 s4096。
+- [x] `optimization-log.md` 明确说明 s4096 是否验证了 s2048 的归因结论。
 
 ### 2. 清理 profiling 结果边界
 
-- [ ] 明确 `results/profile_matrix/*/*_manifest.csv` 是正式 matrix 结果来源。
-- [ ] 检查 `results/colab_kernels/*.json`，把旧单点结果移动到历史目录或重新生成。
-- [ ] 重新生成 `results/colab_kernels/analysis/summary.csv`，保证 summary 和实际 JSON 一致。
-- [ ] 在 README 里说明哪些 `results/` 文件是正式结论，哪些只是历史单点样本。
+- [x] 明确 `results/profile_matrix/*/*_manifest.csv` 是正式 matrix 结果来源。
+- [x] 检查 `results/colab_kernels/*.json`，旧单点结果保留在原目录并标注文档边界，`summary.csv` 已按当前 JSON 重新生成。
+- [x] 重新生成 `results/colab_kernels/analysis/summary.csv`，保证 summary 和实际 JSON 一致。
+- [x] 在 README 里说明哪些 `results/` 文件是正式结论，哪些只是历史单点样本。
 
 验收标准：
 
-- [ ] `summary.csv` 中的关键行和对应 JSON 文件字段一致。
-- [ ] README 不再让读者误把旧单点 JSON 当作当前默认结果。
+- [x] `summary.csv` 中的关键行和对应 JSON 文件字段一致。
+- [x] README 不再让读者误把旧单点 JSON 当作当前默认结果。
 - [ ] `git status --short` 保持干净。
 
 ## P1：Serving 模拟可信化

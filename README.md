@@ -116,7 +116,7 @@ results/profile_matrix/paged/triton_paged_manifest.csv
 results/profile_matrix_report.md
 ```
 
-普通分析只需要这两个 manifest。只有要做单点 `profile_report` 或 source-line 归因时，才需要对应 JSON。
+普通分析和默认参数判断只看这两个 manifest、`results/profile_matrix_report.md` 和 `results/ncu_source_attribution_export/`。`results/colab_kernels/*.json` 是 2026-07-15 的历史单点 microbench 样本，用来复现旧图表或生成单点 `profile_report`，不要当作当前默认配置的验收依据。
 
 ## 常用命令
 
@@ -159,13 +159,15 @@ python scripts/analyze_matrix.py \
   --output results/profile_matrix_report.md
 ```
 
-汇总单点 JSON 图表：
+汇总历史单点 JSON 图表：
 
 ```bash
 python scripts/analyze_results.py \
   --results-dir results/colab_kernels \
   --output-dir results/colab_kernels/analysis
 ```
+
+这会让 `results/colab_kernels/analysis/summary.csv` 与同目录 JSON 保持一致；它不替代 full matrix 报告。
 
 生成单点 profile report：
 
@@ -229,13 +231,12 @@ doc/
 
 - full matrix 目前主要覆盖 `head_dim=128`、`seq_len={2048,4096}`，还需要补 `head_dim=64`、短序列和更多 request length 分布。
 - `triton_paged` 已有真实 paged KV path，但 serving allocator 仍是简化版，还没有完整 free list、request lifecycle 和 fragmentation 统计。
-- `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时；关键 s2048 点已补 source-line / instruction / memory workload 归因，s4096 best-point 仍待复核。
+- `latency_breakdown` 是阶段定义和工作量估算，不是每阶段真实耗时；关键 s2048/s4096 点已补 source-line / instruction / memory workload 归因。
 - 随机 tensor 不能代表真实模型 KV 分布；量化误差还需要真实模型 KV sample workflow。
 
 ## 下一步
 
-1. 在 A100 上补 s4096 fused/paged best-point source attribution，确认 s2048 结论可外推。
-2. 继续做 attribution-driven kernel patch：减少 shared staging / dequant / softmax 更新里的 MIO、short scoreboard，以及 paged block_table 地址计算。
-3. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
-4. 补真实模型 KV sample workflow，验证量化误差和随机 tensor profiling 的差异。
-5. 补测试矩阵和 CI。
+1. 继续做 attribution-driven kernel patch：减少 shared staging / dequant / softmax 更新里的 MIO、short scoreboard，以及 paged block_table 地址计算。
+2. 补 serving allocator、prefill/decode 分离、block utilization 和 fragmentation。
+3. 补真实模型 KV sample workflow，验证量化误差和随机 tensor profiling 的差异。
+4. 补测试矩阵和 CI。
