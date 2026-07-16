@@ -6,8 +6,8 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-results/**/*.json
-results/**/**/*.json
+results/colab_kernels/*.json
+results/profile_matrix/**/*.json
 
 # IDE / 编辑器
 .idea/
