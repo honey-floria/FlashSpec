@@ -236,6 +236,7 @@ scripts/
 
 doc/
   optimization-log.md 实验历史和 profiling 结论
+  project-flow.md     项目流程图和工程闭环说明
   TODO.MD             剩余工作和里程碑
 ```
 
