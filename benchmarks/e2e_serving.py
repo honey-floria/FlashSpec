@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
-from flashspec.serving import ServingConfig, run_decode_simulation
+from flashspec.serving import ServingConfig, run_decode_simulation  # noqa: E402
+from scripts.cli_common import DTYPE_CHOICES, emit_result, parse_int_list  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--allocator-blocks", type=int, default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
+    parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES)
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
@@ -47,7 +48,7 @@ def main() -> None:
     args = parse_args()
     prompt_lens = None
     if args.prompt_lens:
-        prompt_lens = tuple(int(part.strip()) for part in args.prompt_lens.split(",") if part.strip())
+        prompt_lens = tuple(parse_int_list(args.prompt_lens))
     result = run_decode_simulation(
         ServingConfig(
             requests=args.requests,
@@ -64,11 +65,7 @@ def main() -> None:
             dtype=args.dtype,
         )
     )
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        for key, value in result.items():
-            print(f"{key}: {value}")
+    emit_result(result, as_json=args.json)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.cli_common import DTYPE_CHOICES, parse_int_list, parse_str_list  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,26 +25,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
+    parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES)
     parser.add_argument("--output", type=Path, default=Path("results/sweep.csv"))
     return parser.parse_args()
-
-
-def _ints(value: str) -> list[int]:
-    return [int(item.strip()) for item in value.split(",") if item.strip()]
-
-
-def _strings(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def main() -> None:
     args = parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str]] = []
-    for backend in _strings(args.backends):
-        for batch in _ints(args.batches):
-            for seq_len in _ints(args.seq_lens):
+    for backend in parse_str_list(args.backends):
+        for batch in parse_int_list(args.batches):
+            for seq_len in parse_int_list(args.seq_lens):
                 command = [
                     sys.executable,
                     str(ROOT / "benchmarks" / "microbench.py"),
@@ -67,8 +63,6 @@ def main() -> None:
                     "--json",
                 ]
                 proc = subprocess.run(command, cwd=ROOT, check=True, capture_output=True, text=True)
-                import json
-
                 rows.append({key: str(value) for key, value in json.loads(proc.stdout).items()})
 
     fieldnames = sorted({key for row in rows for key in row})

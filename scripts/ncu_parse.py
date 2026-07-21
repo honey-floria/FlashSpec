@@ -129,6 +129,25 @@ def suspicious_kernels(names: list[str]) -> list[str]:
     return flagged
 
 
+def apply_backfill(result: dict, metrics: "NcuMetrics") -> list[str]:
+    """把 metrics 回填进 result 字典，并返回可疑（非 attention）kernel 名列表。
+
+    microbench 的 --profile-ncu 内联回填和 backfill_ncu.py 离线回填共用这一份，
+    保证两条路径写进 JSON 的 measured_* 字段、bandwidth_fields_are_estimates 和
+    profiler_warning 完全一致。可疑 kernel 列表交给调用方决定如何提示用户。
+    """
+
+    result.update(metrics.as_backfill())
+    result["bandwidth_fields_are_estimates"] = False
+    bad = suspicious_kernels(metrics.kernel_names)
+    if bad:
+        result["profiler_warning"] = (
+            "ncu 可能 profile 了非 attention kernel（量化/elementwise），实测字节可能偏大："
+            + ", ".join(sorted(set(bad))[:3])
+        )
+    return bad
+
+
 def _find_col(header: list[str], *candidates: str) -> int | None:
     """在 header 里按候选名（大小写不敏感）找列索引。"""
     lowered = [h.strip().lower() for h in header]

@@ -30,20 +30,11 @@ class QuantizedTensor:
     - 所有 leading 维度都会被保留，并分别独立计算 block 量化参数。
     """
 
-    # 量化后的 int8 数据，布局通常是 [..., n_blocks, block_size, head_dim]。
-    values: torch.Tensor
-
-    # 每个 block 的 scale，形状可广播到 values。
-    scale: torch.Tensor
-
-    # 每个 block 的 zero point，位于 uint8 域，但用 int16 存储便于计算。
-    zero_point: torch.Tensor
-
-    # sequence 维度上每个 block 的 token 数。
-    block_size: int
-
-    # 量化前张量的真实形状；反量化时依赖它裁剪 padding。
-    original_shape: Tuple[int, ...]
+    values: torch.Tensor  # 量化后的 int8 数据，布局通常是 [..., n_blocks, block_size, head_dim]。
+    scale: torch.Tensor  # 每个 block 的 scale，形状可广播到 values。
+    zero_point: torch.Tensor  # 每个 block 的 zero point，位于 uint8 域，但用 int16 存储便于计算。
+    block_size: int  # sequence 维度上每个 block 的 token 数。
+    original_shape: Tuple[int, ...]  # 量化前张量的真实形状；反量化时依赖它裁剪 padding。
 
     @property
     def device(self) -> torch.device:
@@ -211,6 +202,31 @@ def dequantize_int8_per_block(q: QuantizedTensor, dtype: torch.dtype | None = No
 
     # 如果指定 dtype，则把输出转换到目标 dtype；否则保留 float32。
     return x.to(dtype=dtype) if dtype is not None else x
+
+
+def build_compression_stats(
+    dense_bytes: float,
+    quant_bytes: float,
+    *,
+    materializes_dense_kv: bool,
+    **extra: float,
+) -> dict[str, float]:
+    """构造 benchmark/report 用的压缩统计字典（4 条 attention 路径共用）。
+
+    公共字段：dense_kv_bytes / quant_kv_bytes / compression_ratio /
+    materializes_dense_kv。compression_ratio 用 max(1, quant_bytes) 兜底除零。
+    额外的后端专有指标（physical_blocks、num_splits、block_n、num_warps 等）
+    通过 **extra 传入，直接并入返回字典。
+    """
+
+    stats = {
+        "dense_kv_bytes": float(dense_bytes),
+        "quant_kv_bytes": float(quant_bytes),
+        "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
+        "materializes_dense_kv": 1.0 if materializes_dense_kv else 0.0,
+    }
+    stats.update({key: float(value) for key, value in extra.items()})
+    return stats
 
 
 def estimate_quantized_bytes(q: QuantizedTensor) -> int:

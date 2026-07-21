@@ -15,44 +15,19 @@ from .runtime import device_name, resolve_device, resolve_dtype, synchronize
 class ServingConfig:
     """decode serving 模拟的配置。"""
 
-    # 并发请求数量；在 attention 中对应 active batch size。
-    requests: int = 8
-
-    # 兼容旧 CLI 的单一 prompt 长度。
-    prompt_len: int = 128
-
-    # 可选 prompt 长度候选列表；用于 variable-length serving 模拟。
-    prompt_lens: tuple[int, ...] | None = None
-
-    # prompt 长度采样方式：uniform/cycle、random、bimodal。
-    prompt_length_distribution: str = "uniform"
-
-    # decode 阶段要生成多少个全局 step。
-    decode_steps: int = 16
-
-    # 每个 request 生成多少 token 后结束并释放 block；0 表示不模拟 finish/arrival。
-    request_life_steps: int = 0
-
-    # attention head 数。
-    heads: int = 8
-
-    # 单个 attention head 的隐藏维度。
-    head_dim: int = 64
-
-    # paged cache 的 block 粒度。
-    block_size: int = 16
-
-    # allocator 的 physical block 容量；None 时按模拟规模自动估算。
-    allocator_blocks: int | None = None
-
-    # 固定随机种子，保证每次模拟生成相同的伪输入。
-    seed: int = 0
-
-    # 运行设备配置，比如 "auto"、"cpu"、"cuda"。
-    device: str = "auto"
-
-    # 运行 dtype 配置，比如 "auto"、"float16"、"bfloat16"、"float32"。
-    dtype: str = "auto"
+    requests: int = 8  # 并发请求数量；在 attention 中对应 active batch size。
+    prompt_len: int = 128  # 兼容旧 CLI 的单一 prompt 长度。
+    prompt_lens: tuple[int, ...] | None = None  # 可选 prompt 长度候选列表；用于 variable-length 模拟。
+    prompt_length_distribution: str = "uniform"  # prompt 长度采样方式：uniform/cycle、random、bimodal。
+    decode_steps: int = 16  # decode 阶段要生成多少个全局 step。
+    request_life_steps: int = 0  # 每个 request 生成多少 token 后结束并释放 block；0 表示不模拟 finish/arrival。
+    heads: int = 8  # attention head 数。
+    head_dim: int = 64  # 单个 attention head 的隐藏维度。
+    block_size: int = 16  # paged cache 的 block 粒度。
+    allocator_blocks: int | None = None  # allocator 的 physical block 容量；None 时按模拟规模自动估算。
+    seed: int = 0  # 固定随机种子，保证每次模拟生成相同的伪输入。
+    device: str = "auto"  # 运行设备配置，比如 "auto"、"cpu"、"cuda"。
+    dtype: str = "auto"  # 运行 dtype 配置，比如 "auto"、"float16"、"bfloat16"、"float32"。
 
 
 def run_decode_simulation(config: ServingConfig) -> Dict[str, float | int | str | list[int]]:

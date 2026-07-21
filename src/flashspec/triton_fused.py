@@ -23,8 +23,22 @@ import os
 
 import torch
 
-from .quant import QuantizedTensor, estimate_quantized_bytes
-from .triton_utils import HAS_TRITON, next_power_of_2, tl, triton
+from .quant import QuantizedTensor, build_compression_stats, estimate_quantized_bytes
+from .triton_utils import (
+    HAS_TRITON,
+    dispatch_triton_or_fallback,
+    effective_length,
+    load_query,
+    make_dim_offsets,
+    next_power_of_2,
+    normalize_acc,
+    pid_to_batch_head,
+    resolve_block_n as _resolve_block_n,
+    resolve_num_warps as _resolve_num_warps,
+    tl,
+    triton,
+    validate_decode_query,
+)
 
 
 @dataclass(frozen=True)
@@ -97,52 +111,8 @@ class FusedAttentionMeta:
 
 if HAS_TRITON:
 
-    @triton.jit
-    def _pid_to_batch_head(pid, heads: tl.constexpr):
-        """把展平后的 program id 还原成 batch/head 下标。"""
-
-        batch_idx = pid // heads
-        head_idx = pid - batch_idx * heads
-        return batch_idx, head_idx
-
-    @triton.jit
-    def _make_dim_offsets(head_dim: tl.constexpr, block_d: tl.constexpr):
-        """生成 head_dim 维度上的向量化偏移和 padding mask。"""
-
-        offs_d = tl.arange(0, block_d)
-        d_mask = offs_d < head_dim
-        return offs_d, d_mask
-
-    @triton.jit
-    def _load_query(
-        q_ptr,
-        batch_idx,
-        head_idx,
-        heads: tl.constexpr,
-        head_dim: tl.constexpr,
-        offs_d,
-        d_mask,
-    ):
-        """读取当前 [batch, head] 的 query 向量，并返回它的展平 base 地址。"""
-
-        q_base = (batch_idx * heads + head_idx) * head_dim
-        q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0).to(tl.float32)
-        return q_base, q
-
-    @triton.jit
-    def _effective_length(
-        lengths_ptr,
-        batch_idx,
-        seq_len: tl.constexpr,
-        has_lengths: tl.constexpr,
-    ):
-        """返回当前 batch 的有效 sequence 长度。"""
-
-        effective_len = seq_len
-        if has_lengths:
-            loaded_len = tl.load(lengths_ptr + batch_idx)
-            effective_len = tl.minimum(loaded_len, seq_len)
-        return effective_len
+    # program-id 拆分、head_dim 偏移、query 载入、有效长度、softmax 归一等
+    # 与 KV 布局无关的通用 jit helper 现在集中在 triton_utils，fused/paged 共用。
 
     @triton.jit
     def _fused_attention_tile(
@@ -230,14 +200,6 @@ if HAS_TRITON:
         return new_m, new_l, acc
 
     @triton.jit
-    def _normalize_acc(acc, l):
-        """将未归一化 PV 累积除以 softmax 分母；空序列输出 0。"""
-
-        denom = tl.where(l > 0.0, l, 1.0)
-        out = acc / denom
-        return tl.where(l > 0.0, out, 0.0)
-
-    @triton.jit
     def _fused_dequant_attention_kernel(
         q_ptr,
         k_values_ptr,
@@ -301,19 +263,19 @@ if HAS_TRITON:
 
         # 从 pid 还原 batch 下标和 head 下标：
         # pid = batch_idx * heads + head_idx。
-        batch_idx, head_idx = _pid_to_batch_head(pid, heads)
+        batch_idx, head_idx = pid_to_batch_head(pid, heads)
 
         # 当前 head 内的 feature/head_dim 下标。
         # offs_d 长度是 block_d，可能大于真实 head_dim；d_mask 屏蔽 padding lane。
-        offs_d, d_mask = _make_dim_offsets(head_dim, block_d)
+        offs_d, d_mask = make_dim_offsets(head_dim, block_d)
 
         # q 的布局是 [batch, heads, head_dim]，这里读取当前 [batch, head] 的 q 向量。
         # q_base 是这个向量在展平内存中的起始元素下标。
-        q_base, q = _load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
+        q_base, q = load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
 
         # effective_len 表示当前 batch 真实参与 attention 的 token 数。
         # 如果传入 lengths，则每个 batch 可以有不同有效长度；否则默认 seq_len 全有效。
-        effective_len = _effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
+        effective_len = effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
 
         # online softmax 的状态：
         # m 是当前已扫描 scores 的最大值；
@@ -357,7 +319,7 @@ if HAS_TRITON:
 
         # 如果 effective_len 为 0，l 会保持 0；这种异常输入下输出置 0。
         # 先保护分母，避免先执行 acc / 0 再 where 造成无效浮点中间值。
-        out = _normalize_acc(acc, l)
+        out = normalize_acc(acc, l)
 
         # 输出布局是 [batch, heads, head_dim]，与 q 一致。
         tl.store(out_ptr + q_base + offs_d, out, mask=d_mask)
@@ -423,15 +385,15 @@ if HAS_TRITON:
         pid = tl.program_id(0)
         split_id = tl.program_id(1)
 
-        batch_idx, head_idx = _pid_to_batch_head(pid, heads)
+        batch_idx, head_idx = pid_to_batch_head(pid, heads)
 
-        offs_d, d_mask = _make_dim_offsets(head_dim, block_d)
+        offs_d, d_mask = make_dim_offsets(head_dim, block_d)
 
         # q_base 指向当前 [batch, head] query 向量。
-        q_base, q = _load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
+        q_base, q = load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
 
         # effective_len 用于 variable length；超过该长度的 token 不参与当前 split。
-        effective_len = _effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
+        effective_len = effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
 
         # 本段负责的 token 区间。split_end 不超过 seq_len。
         # 例如 seq_len=2048,num_splits=4 时，通常每段约 512 个 token。
@@ -537,7 +499,7 @@ if HAS_TRITON:
             acc = acc * old_scale + pacc * cur_scale
             m = new_m
 
-        out = _normalize_acc(acc, l)
+        out = normalize_acc(acc, l)
         tl.store(out_ptr + pid * head_dim + offs_d, out, mask=d_mask)
 
 
@@ -566,8 +528,7 @@ def _validate_triton_fused_inputs(
     - head_dim 当前限制为不超过 256，覆盖 TODO.svg 中要求的 64/128。
     """
 
-    if q.ndim != 3:
-        raise ValueError("q 必须是 [batch, heads, head_dim] 形状")
+    validate_decode_query(q, kernel_name="fused")
     if len(k_quant.original_shape) != 4 or len(v_quant.original_shape) != 4:
         raise ValueError("k_quant 和 v_quant 必须来自 [batch, heads, seq_len, head_dim] 张量")
     if k_quant.original_shape != v_quant.original_shape:
@@ -578,8 +539,6 @@ def _validate_triton_fused_inputs(
         k_quant.original_shape[3],
     ):
         raise ValueError("q 的 batch、heads 和 head_dim 必须与量化 K/V 对齐")
-    if q.device.type != "cuda":
-        raise RuntimeError("Triton fused attention 需要 CUDA q tensor")
     if k_quant.device != q.device or v_quant.device != q.device:
         raise RuntimeError("q、k_quant 和 v_quant 必须位于同一个 CUDA 设备")
     if lengths is not None:
@@ -587,14 +546,12 @@ def _validate_triton_fused_inputs(
             raise ValueError("lengths 必须是 [batch] 形状")
         if lengths.device != q.device:
             raise RuntimeError("lengths 必须与 q 位于同一个 CUDA 设备")
-    if q.shape[-1] > 256:
-        raise ValueError("Triton fused attention 当前只支持 head_dim <= 256")
 
 
 # Split-K 默认参数；实验结论见 doc/optimization-log.md。
 # 矩阵 profiling 显示 s2048/s4096 的 fused 最优点都在 block_n=128,
 # num_warps=4, split=4。短序列仍保留单 kernel 快路径，避免 combine 开销。
-_DEFAULT_BLOCK_N = 128
+# block_n/num_warps 的默认值与解析在 triton_utils，这里只保留 Split-K 专有参数。
 _DEFAULT_NUM_SPLITS = 4
 _TOKENS_PER_SPLIT = 512
 _S_MAX = 32
@@ -644,49 +601,6 @@ def _compute_num_splits(seq_len: int, block_n: int) -> int:
     return max(1, min(s, _S_MAX))
 
 
-def _resolve_block_n() -> int:
-    """每个 program 每轮扫描的 token 数。默认 128。
-
-    profiling matrix 结论：block_n=128 的有效 DRAM throughput 最好；
-    block_n=32 虽然 occupancy 更高但明显更慢。A/B 开关仍保留：
-    寄存器占用与 block_n 成正比。调小 block_n 可降低 registers_per_thread、
-    抬高占用率天花板，代价是循环轮数和 MIO/scoreboard 压力增加。
-    - FLASHSPEC_BLOCK_N=32  每轮扫 32 token（更少寄存器）；
-    - FLASHSPEC_BLOCK_N=64  旧默认；
-    - FLASHSPEC_BLOCK_N=128 当前默认；
-    - 未设置或非法值        用默认 128。
-    限制为 [16, 128] 内的 2 的幂，避免病态 tile 尺寸。
-    """
-
-    override = os.environ.get("FLASHSPEC_BLOCK_N")
-    if override is not None:
-        try:
-            v = int(override)
-        except ValueError:
-            v = 0
-        if v in (16, 32, 64, 128):
-            return v
-    return _DEFAULT_BLOCK_N
-
-
-def _resolve_num_warps() -> int:
-    """Triton program 的 warp 数。默认 4，可用环境变量做 profiling sweep。
-
-    早期 A100 实测显示 8 warp 比 4 warp 慢，但后续会结合 block_n/Split-K
-    做矩阵验证；因此这里保留开关，避免每次实验都改代码。
-    """
-
-    override = os.environ.get("FLASHSPEC_NUM_WARPS")
-    if override is not None:
-        try:
-            v = int(override)
-        except ValueError:
-            v = 0
-        if v in (1, 2, 4, 8):
-            return v
-    return 4
-
-
 def _run_fused_dequant_attention_triton(
     q: torch.Tensor,
     k_quant: QuantizedTensor,
@@ -724,38 +638,28 @@ def _run_fused_dequant_attention_triton(
     _validate_triton_fused_inputs(q, k_quant, v_quant, lengths)
 
     # contiguous 只整理现有输入布局，不生成 dense K/V 中间结果。
-    # q_contig: [batch, heads, head_dim]。
-    q_contig = q.contiguous()
-    # k_values/v_values: [batch, heads, n_blocks, block_size, head_dim] 的 INT8 数据。
-    k_values = k_quant.values.contiguous()
-    # k_scale/v_scale: [batch, heads, n_blocks, 1, 1] 的 FP32 scale。
-    k_scale = k_quant.scale.contiguous()
-    # k_zero/v_zero: [batch, heads, n_blocks, 1, 1] 的 int16 zero point。
-    k_zero = k_quant.zero_point.contiguous()
+    q_contig = q.contiguous()  # [batch, heads, head_dim]。
+    k_values = k_quant.values.contiguous()  # [batch, heads, n_blocks, block_size, head_dim] 的 INT8 数据。
+    k_scale = k_quant.scale.contiguous()  # [batch, heads, n_blocks, 1, 1] 的 FP32 scale。
+    k_zero = k_quant.zero_point.contiguous()  # [batch, heads, n_blocks, 1, 1] 的 int16 zero point。
     v_values = v_quant.values.contiguous()
     v_scale = v_quant.scale.contiguous()
     v_zero = v_quant.zero_point.contiguous()
     # lengths_contig 在 has_lengths=False 时传 q_contig 作为占位指针；kernel 不会读取。
     lengths_contig = lengths.contiguous() if lengths is not None else q_contig
 
-    # batch: request 数；heads: 每个 request 的 attention head 数；head_dim: 单 head 维度。
-    batch, heads, head_dim = q_contig.shape
-    # seq_len: 量化前 K/V 的真实 sequence 长度；n_blocks: 量化 block 数。
-    seq_len = int(k_quant.original_shape[-2])
-    n_blocks = int(k_values.shape[-3])
-    # block_size: 每个量化 block 覆盖多少个 token。
-    block_size = int(k_quant.block_size)
-    # block_d: Triton tile 的 feature 维度，取 2 的幂便于 tl.arange 和向量化。
-    block_d = next_power_of_2(int(head_dim))
+    batch, heads, head_dim = q_contig.shape  # request 数 / 每 request 的 head 数 / 单 head 维度。
+    seq_len = int(k_quant.original_shape[-2])  # 量化前 K/V 的真实 sequence 长度。
+    n_blocks = int(k_values.shape[-3])  # 量化 block 数。
+    block_size = int(k_quant.block_size)  # 每个量化 block 覆盖多少个 token。
+    block_d = next_power_of_2(int(head_dim))  # Triton tile 的 feature 维度，取 2 的幂便于向量化。
 
     # block_n 是每个 program 每轮扫描的 token 数（实验 4：可用 FLASHSPEC_BLOCK_N 覆盖）。
     # tile [block_n, block_d] 越小，registers_per_thread 越低、占用率天花板越高。
     block_n = _resolve_block_n()
     num_warps = _resolve_num_warps()
-    # out 与 q 同形状同 dtype；kernel 内部 FP32 累积，写回时按 out dtype 转换。
-    out = torch.empty_like(q_contig)
-    # sm_scale 是 scaled dot-product attention 的 1/sqrt(d) 缩放。
-    sm_scale = 1.0 / math.sqrt(float(head_dim))
+    out = torch.empty_like(q_contig)  # 与 q 同形状同 dtype；kernel 内部 FP32 累积后按 out dtype 写回。
+    sm_scale = 1.0 / math.sqrt(float(head_dim))  # scaled dot-product attention 的 1/sqrt(d) 缩放。
 
     # num_splits 控制数据路径：1=单 kernel，>1=Split-K split+combine。
     num_splits = _compute_num_splits(seq_len, block_n)
@@ -844,18 +748,16 @@ def _run_fused_dequant_attention_triton(
 
     dense_bytes = 2 * batch * heads * seq_len * head_dim * q_contig.element_size()
     quant_bytes = estimate_quantized_bytes(k_quant) + estimate_quantized_bytes(v_quant)
-    stats = {
-        "dense_kv_bytes": float(dense_bytes),
-        "quant_kv_bytes": float(quant_bytes),
-        "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
-        "materializes_dense_kv": 0.0,
-        # Split-K 段数：1 表示走单 kernel 快路径，>1 表示 split+combine 路径。
-        "num_splits": float(num_splits),
-        # 每轮扫描 token 数（实验 4 降寄存器 A/B 变量）。
-        "block_n": float(block_n),
-        # 每个 Triton program 的 warp 数（实验 5 profiling matrix 变量）。
-        "num_warps": float(num_warps),
-    }
+    # 真正的 fused kernel 不物化 dense KV，故 materializes_dense_kv=False。
+    # num_splits：1=单 kernel 快路径，>1=split+combine；block_n/num_warps 为 profiling A/B 变量。
+    stats = build_compression_stats(
+        dense_bytes,
+        quant_bytes,
+        materializes_dense_kv=False,
+        num_splits=float(num_splits),
+        block_n=float(block_n),
+        num_warps=float(num_warps),
+    )
     return out, stats
 
 
@@ -875,10 +777,15 @@ def fused_dequant_attention_triton(*_args: Any, **_kwargs: Any) -> Any:
     - 否则延迟导入并调用 PyTorch 参考实现，保证 CPU 环境仍可导入和 smoke test。
     """
 
-    if HAS_TRITON and _args and isinstance(_args[0], torch.Tensor) and _args[0].device.type == "cuda":
-        return _run_fused_dequant_attention_triton(*_args, **_kwargs)
+    # 非 CUDA 或未安装 Triton 时走的 portable fallback 会 materialize dense KV。
+    def _load_fallback():
+        from .attention import fused_dequant_attention
 
-    # 非 CUDA 或未安装 Triton 时使用 portable fallback；这个 fallback 会 materialize dense KV。
-    from .attention import fused_dequant_attention
+        return fused_dequant_attention
 
-    return fused_dequant_attention(*_args, **_kwargs)
+    return dispatch_triton_or_fallback(
+        _args,
+        _kwargs,
+        run_triton=_run_fused_dequant_attention_triton,
+        load_fallback=_load_fallback,
+    )

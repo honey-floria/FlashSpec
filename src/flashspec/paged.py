@@ -337,18 +337,12 @@ class PagedKVCache:
         if block_size <= 0:
             raise ValueError("block_size 必须为正数")
 
-        # batch: 序列数量；heads: attention head 数；
-        # seq_len: 每条序列的 token 数；head_dim: 单个 head 的维度。
+        # 序列数量 / attention head 数 / 每条序列的 token 数 / 单个 head 的维度。
         batch, heads, seq_len, head_dim = k.shape
 
-        # 每条序列需要多少个 logical block；不足一个 block 的尾部会补零。
-        blocks_per_seq = (seq_len + block_size - 1) // block_size
-
-        # 当前简单实现中，每个 batch 的每个 logical block 都分配一个 physical block。
-        total_blocks = batch * blocks_per_seq
-
-        # padding 后的 sequence 长度，保证能被 block_size 整除。
-        padded_seq_len = blocks_per_seq * block_size
+        blocks_per_seq = (seq_len + block_size - 1) // block_size  # 每条序列的 logical block 数；尾部补零。
+        total_blocks = batch * blocks_per_seq  # 当前实现每个 batch 的每个 logical block 各分配一个 physical block。
+        padded_seq_len = blocks_per_seq * block_size  # padding 后的 sequence 长度，保证能被 block_size 整除。
         if padded_seq_len != seq_len:
             # 只在 sequence 维度补零；这些 padding token 会通过 lengths 在 attention 中屏蔽。
             pad_shape = (batch, heads, padded_seq_len - seq_len, head_dim)

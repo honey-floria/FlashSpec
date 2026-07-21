@@ -11,6 +11,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from flashspec import (
     PagedKVAllocator,
@@ -25,7 +26,7 @@ from flashspec import (
 )
 import flashspec.triton_fused as triton_fused
 import flashspec.triton_paged as triton_paged
-from flashspec.triton_kernels import HAS_TRITON
+from flashspec.triton_utils import HAS_TRITON
 
 
 class FlashSpecTest(unittest.TestCase):
@@ -391,6 +392,37 @@ class FlashSpecTest(unittest.TestCase):
         actual, stats = paged_quant_attention_triton(q, cache, return_stats=True)
         torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-2)
         self.assertEqual(stats["materializes_dense_kv"], 0.0)
+
+
+class NcuBackfillTest(unittest.TestCase):
+    """覆盖 microbench 和 backfill_ncu 共用的 ncu 回填 helper（纯 CPU，无需 CUDA）。"""
+
+    _CSV = (
+        "==PROF== banner line to skip\n"
+        '"ID","Kernel Name","Metric Name","Metric Value","Metric Unit"\n'
+        '"0","fused_dequant_attention_kernel","dram__bytes_read.sum","1000","byte"\n'
+        '"0","fused_dequant_attention_kernel","gpu__time_duration.sum","10","ns"\n'
+    )
+
+    def test_apply_backfill_writes_measured_fields_and_clears_estimate_flag(self) -> None:
+        from scripts.ncu_parse import apply_backfill, parse_ncu_csv
+
+        result = {"bandwidth_fields_are_estimates": True}
+        bad = apply_backfill(result, parse_ncu_csv(self._CSV))
+        self.assertEqual(bad, [])
+        self.assertFalse(result["bandwidth_fields_are_estimates"])
+        self.assertEqual(result["measured_dram_bytes"], 1000.0)
+        self.assertEqual(result["measured_ncu_kernel_count"], 1)
+        self.assertNotIn("profiler_warning", result)
+
+    def test_apply_backfill_flags_suspicious_kernels(self) -> None:
+        from scripts.ncu_parse import apply_backfill, parse_ncu_csv
+
+        csv_text = self._CSV.replace("fused_dequant_attention_kernel", "vectorized_elementwise_kernel")
+        result: dict = {}
+        bad = apply_backfill(result, parse_ncu_csv(csv_text))
+        self.assertTrue(bad)
+        self.assertIn("profiler_warning", result)
 
 
 if __name__ == "__main__":

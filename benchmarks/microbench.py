@@ -12,7 +12,9 @@ from typing import Callable
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+# 同时加入 ROOT 和 ROOT/src：flashspec 包在 src 下，scripts.ncu_parse 在 ROOT 下。
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from flashspec import (
     PagedKVCache,
@@ -24,8 +26,9 @@ from flashspec import (
     reference_attention,
 )
 from flashspec.runtime import device_name, resolve_device, resolve_dtype, synchronize
-from flashspec.triton_kernels import HAS_TRITON
-from flashspec.ncu_parse import parse_ncu_csv
+from flashspec.triton_utils import HAS_TRITON
+from scripts.cli_common import DTYPE_CHOICES, emit_result, microbench_cli_args
+from scripts.ncu_parse import apply_backfill, parse_ncu_csv
 
 # 回填 measured_* 字段所需的最小 ncu metric 集合（与 ncu_parse 对齐）。
 NCU_METRICS = (
@@ -39,8 +42,7 @@ NCU_METRICS = (
     "sm__maximum_warps_per_active_cycle_pct"
 )
 NCU_SOURCE_SECTIONS = ("SourceCounters", "InstructionStats", "MemoryWorkloadAnalysis", "SchedulerStats")
-# 默认只 profile 这么多次 launch（匹配到的），控制 ncu 开销。
-NCU_LAUNCH_COUNT = 5
+NCU_LAUNCH_COUNT = 5  # 默认只 profile 这么多次 launch（匹配到的），控制 ncu 开销。
 
 # 各 backend 真正要 profile 的 kernel 名（正则）。用名字过滤而非 launch 序号，
 # 才能避开 backend 在计时前做的量化 elementwise kernel（Div/round/clamp/add），
@@ -177,31 +179,38 @@ def _measure_latency_ms(
     return out, raw_latency_ms, timing_method
 
 
-def _microbench_command_args(args: argparse.Namespace) -> list[str]:
-    """返回 ncu 子进程要复现当前 benchmark 配置的参数。"""
+def _microbench_cli_args(args: argparse.Namespace, *, include_json: bool) -> list[str]:
+    """复现当前 benchmark 配置的 microbench CLI 参数（ncu profiling 固定单 repeat + CUDA）。
 
-    cmd = [
-        "python", "benchmarks/microbench.py",
-        "--backend", args.backend,
-        "--batch", str(args.batch),
-        "--heads", str(args.heads),
-        "--seq-len", str(args.seq_len),
-        "--head-dim", str(args.head_dim),
-        "--block-size", str(args.block_size),
-        "--iters", str(max(1, args.iters)),
-        "--warmup", str(max(1, args.warmup)),
-        "--repeats", "1",
-        "--device", "cuda",
-        "--dtype", args.dtype,
-        "--paged-layout", args.paged_layout,
-        "--layout-seed", str(args.layout_seed),
-        "--length-pattern", args.length_pattern,
-        "--seed", str(args.seed),
-        "--json",
-    ]
-    if args.lengths:
-        cmd += ["--lengths", args.lengths]
-    return cmd
+    include_json 控制是否带 --json：可复制的 profiling 命令模板需要 JSON 输出，
+    而 ncu 回填子进程刻意不带 --json，避免 JSON blob 混进 ncu 的 --csv stdout。
+    """
+
+    return microbench_cli_args(
+        backend=args.backend,
+        batch=args.batch,
+        heads=args.heads,
+        seq_len=args.seq_len,
+        head_dim=args.head_dim,
+        block_size=args.block_size,
+        iters=args.iters,
+        warmup=args.warmup,
+        repeats=1,
+        device="cuda",
+        dtype=args.dtype,
+        paged_layout=args.paged_layout,
+        layout_seed=args.layout_seed,
+        length_pattern=args.length_pattern,
+        seed=args.seed,
+        lengths=args.lengths,
+        include_json_flag=include_json,
+    )
+
+
+def _microbench_command_args(args: argparse.Namespace) -> list[str]:
+    """返回可复制的 profiling 命令（含前导 python + 脚本路径 + --json）。"""
+
+    return ["python", "benchmarks/microbench.py", *_microbench_cli_args(args, include_json=True)]
 
 
 def _env_command_prefix() -> str:
@@ -268,20 +277,11 @@ def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
         "--launch-count", str(args.ncu_launch_count),
         "--target-processes", "all",
         "--csv",
+        # 用当前解释器和脚本绝对路径复现同一份 benchmark 配置（子进程去掉 --profile-ncu 防递归）。
+        # 不带 --json：避免 microbench 的 JSON 输出混入 ncu 的 --csv stdout 干扰解析。
         sys.executable, str(Path(__file__).resolve()),
-        "--backend", args.backend,
-        "--batch", str(args.batch), "--heads", str(args.heads),
-        "--seq-len", str(args.seq_len), "--head-dim", str(args.head_dim),
-        "--block-size", str(args.block_size),
-        "--paged-layout", args.paged_layout,
-        "--layout-seed", str(args.layout_seed),
-        "--length-pattern", args.length_pattern,
-        "--seed", str(args.seed),
-        "--iters", str(max(1, args.iters)), "--warmup", str(max(1, args.warmup)),
-        "--repeats", "1", "--device", "cuda", "--dtype", args.dtype,
+        *_microbench_cli_args(args, include_json=False),
     ]
-    if args.lengths:
-        cmd += ["--lengths", args.lengths]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.ncu_timeout)
     except FileNotFoundError:
@@ -305,16 +305,7 @@ def _run_ncu_and_backfill(args: argparse.Namespace, result: dict) -> dict:
         result["profiler_error"] = f"解析 ncu CSV 失败：{exc}"
         return result
 
-    from flashspec.ncu_parse import suspicious_kernels
-
-    bad = suspicious_kernels(parsed.kernel_names)
-    if bad:
-        result["profiler_warning"] = (
-            "ncu 可能 profile 了非 attention kernel（量化/elementwise），实测字节可能偏大："
-            + ", ".join(sorted(set(bad))[:3])
-        )
-    result.update(parsed.as_backfill())
-    result["bandwidth_fields_are_estimates"] = False
+    apply_backfill(result, parsed)
     return result
 
 
@@ -434,7 +425,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--backend", choices=["dense", "fused", "triton_fused", "paged", "triton_paged"], default="paged")
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="auto", choices=["auto", "float16", "fp16", "bfloat16", "bf16", "float32", "fp32"])
+    parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--raw-output", type=Path)
@@ -587,7 +578,7 @@ def main() -> None:
         # 1=走单 kernel 快路径，>1=走 split+combine 路径。用于验证 Split-K 是否生效。
         "num_splits": stats.get("num_splits"),
         # kernel tile / 环境覆盖：后续优化实验必须能从 JSON 反查真实运行配置。
-        # 目前 block_n 由 Triton backend stats 回填；portable backend 无此概念。
+        # block_n 由 Triton backend stats 回填；portable backend 无此概念，为 None。
         "block_n": stats.get("block_n"),
         "num_warps": stats.get("num_warps"),
         "env_flashspec_num_splits": os.environ.get("FLASHSPEC_NUM_SPLITS"),
@@ -637,11 +628,7 @@ def main() -> None:
     if args.raw_output:
         args.raw_output.parent.mkdir(parents=True, exist_ok=True)
         args.raw_output.write_text(json.dumps({"raw_latency_ms": raw_latency_ms}, indent=2), encoding="utf-8")
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        for key, value in result.items():
-            print(f"{key}: {value}")
+    emit_result(result, as_json=args.json)
 
 
 if __name__ == "__main__":

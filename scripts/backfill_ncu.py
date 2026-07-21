@@ -21,8 +21,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from flashspec.ncu_parse import parse_ncu_csv, suspicious_kernels  # noqa: E402
+# scripts.ncu_parse 是同目录下的兄弟模块，需要 ROOT（而非 ROOT/src）在 sys.path 上。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.ncu_parse import apply_backfill, parse_ncu_csv  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,19 +64,15 @@ def main() -> None:
         csv_text = _csv_from_rep(args.ncu_rep, args.ncu_bin)
 
     metrics = parse_ncu_csv(csv_text)
-    bad = suspicious_kernels(metrics.kernel_names)
+    data = json.loads(args.json.read_text(encoding="utf-8"))
+    # 回填 measured_* 字段 + bandwidth_fields_are_estimates + profiler_warning（与 microbench 共用）。
+    bad = apply_backfill(data, metrics)
     if bad:
-        # 如果采样到了不该 profile 的 kernel，先提醒用户；这类数据往往会把带宽放大。
+        # 采样到不该 profile 的 kernel 时，额外在 stdout 给出更详细的逐条提示。
         print("[警告] 疑似 profile 了非 attention kernel（量化/elementwise），实测字节可能偏大：")
         for n in sorted(set(bad))[:5]:
             print(f"    - {n}")
         print("  建议用 --kernel-name regex 只 profile attention kernel 后重新采集。")
-    data = json.loads(args.json.read_text(encoding="utf-8"))
-    # metrics.as_backfill() 返回的是适合直接塞回 microbench JSON 的字段集合。
-    data.update(metrics.as_backfill())
-    data["bandwidth_fields_are_estimates"] = False
-    if bad:
-        data["profiler_warning"] = "ncu 可能 profile 了非 attention kernel：" + ", ".join(sorted(set(bad))[:3])
 
     est = data.get("estimated_effective_quant_kv_bandwidth_gbps")
     meas = metrics.achieved_bandwidth_gbps

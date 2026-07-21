@@ -6,7 +6,12 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from .paged import PagedKVCache
-from .quant import QuantizedTensor, dequantize_int8_per_block, estimate_quantized_bytes
+from .quant import (
+    QuantizedTensor,
+    build_compression_stats,
+    dequantize_int8_per_block,
+    estimate_quantized_bytes,
+)
 
 
 def _validate_decode_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -158,16 +163,8 @@ def fused_dequant_attention(
     quant_bytes = estimate_quantized_bytes(k_quant) + estimate_quantized_bytes(v_quant)
 
     # stats: 给 benchmark/report 使用的轻量指标，不参与 attention 正确性计算。
-    stats = {
-        "dense_kv_bytes": float(dense_bytes),
-        "quant_kv_bytes": float(quant_bytes),
-
-        # 防止极端情况下 quant_bytes 为 0 导致除零。
-        "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
-
-        # 当前 PyTorch 参考后端会物化 dense KV，所以标记为 1.0。
-        "materializes_dense_kv": 1.0,
-    }
+    # 当前 PyTorch 参考后端会物化 dense KV，所以 materializes_dense_kv=True。
+    stats = build_compression_stats(dense_bytes, quant_bytes, materializes_dense_kv=True)
     return out, stats
 
 
@@ -215,17 +212,12 @@ def paged_quant_attention(
     quant_bytes = cache.estimated_bytes()
 
     # stats: paged quant attention 路径的压缩和实现特征指标。
-    stats = {
-        "dense_kv_bytes": float(dense_bytes),
-        "quant_kv_bytes": float(quant_bytes),
-
-        # dense KV 相对于 paged quant KV 的理论压缩比例。
-        "compression_ratio": float(dense_bytes / max(1, quant_bytes)),
-
-        # block_table >= 0 的条目数量，即当前已分配/有效的物理 block 引用数。
-        "physical_blocks": float(cache.block_table.ge(0).sum().item()),
-
-        # 当前 PyTorch 参考实现仍会通过 cache.to_dense() 物化 dense KV。
-        "materializes_dense_kv": 1.0,
-    }
+    # physical_blocks 是 block_table >= 0 的条目数（已分配/有效的物理 block 引用数）；
+    # 当前 PyTorch 参考实现仍会通过 cache.to_dense() 物化 dense KV。
+    stats = build_compression_stats(
+        dense_bytes,
+        quant_bytes,
+        materializes_dense_kv=True,
+        physical_blocks=float(cache.block_table.ge(0).sum().item()),
+    )
     return out, stats

@@ -19,16 +19,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-
-def _ints(value: str) -> list[int]:
-    # 命令行参数统一用逗号分隔，这里转成整数列表，方便后面用 product 展开矩阵。
-    return [int(item.strip()) for item in value.split(",") if item.strip()]
-
-
-def _strings(value: str) -> list[str]:
-    # 同样的解析方式也适用于字符串枚举，比如 layout / length pattern。
-    return [item.strip() for item in value.split(",") if item.strip()]
+from scripts.cli_common import parse_int_list as _ints, parse_str_list as _strings  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

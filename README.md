@@ -268,11 +268,9 @@ src/flashspec/
   paged.py           paged quant-KV cache、allocator 和 block_table
   runtime.py         设备 / dtype 辅助函数
   serving.py         allocator 驱动的 decode serving loop
-  ncu_parse.py       Nsight Compute CSV 解析器
   triton_fused.py    Kernel 1：fused INT8 KV attention
   triton_paged.py    Kernel 2：paged INT8 KV attention
-  triton_utils.py    可选 Triton 导入辅助
-  triton_kernels.py  兼容性导出
+  triton_utils.py    可选 Triton 导入 + 共享 kernel 辅助（block_n/warps/回退分发/校验）
 
 benchmarks/
   microbench.py      kernel 延迟 / 带宽 / NCU 采集
@@ -280,6 +278,8 @@ benchmarks/
   e2e_serving.py     serving allocator benchmark
 
 scripts/
+  cli_common.py                benchmarks/scripts 共用的命令行辅助
+  ncu_parse.py                 Nsight Compute CSV 解析器
   profile_matrix.py            矩阵 profiling 执行器
   analyze_results.py           单点 JSON 汇总和图表
   profile_report.py            单个 JSON 的 Markdown 报告
