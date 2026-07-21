@@ -45,6 +45,59 @@ num_splits = 4  # triton_fused
 
 完整实验过程和历史结论见 [doc/optimization-log.md](doc/optimization-log.md)。
 
+## 结果速查表
+
+以下速查表汇总 Colab A100 full matrix（120 点）的关键参数结果，方便快速对比。完整逐点数据见 [results/profile_matrix_report.md](results/profile_matrix_report.md)。
+
+### 各后端最优点（s2048 / s4096, d128）
+
+| backend | seq | 最优配置 | latency ms | BW GB/s | DRAM % | occ % | regs |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `triton_fused` | 2048 | `block_n=128, warps=4, split=4, uniform, contiguous` | 0.2555 | 918.9 | 59.1 | 18.0 | 168 |
+| `triton_fused` | 4096 | `block_n=128, warps=4, split=4, uniform, contiguous` | 0.4856 | 931.6 | 59.9 | 18.0 | 168 |
+| `triton_paged` | 2048 | `block_n=128, warps=4, uniform, contiguous` | 0.2858 | 790.7 | 50.8 | 15.5 | 168 |
+| `triton_paged` | 4096 | `block_n=128, warps=4, uniform, contiguous` | 0.5604 | 789.4 | 50.8 | 15.5 | 168 |
+
+### block_n × num_warps 平均（triton_fused）
+
+| block_n | num_warps | points | avg latency ms | avg BW GB/s | avg DRAM % | avg occ % | avg regs |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 8 | 0.3880 | 900.7 | 57.9 | 17.5 | 168 |
+| 128 | 8 | 8 | 0.5671 | 605.8 | 39.0 | 24.1 | 119 |
+| 64 | 4 | 8 | 0.4478 | 771.8 | 49.6 | 24.1 | 110 |
+| 64 | 8 | 8 | 0.7486 | 448.2 | 28.8 | 26.3 | 106 |
+| 32 | 4 | 8 | 0.5910 | 567.6 | 36.5 | 36.7 | 74 |
+| 32 | 8 | 8 | 1.1275 | 294.7 | 19.0 | 35.2 | 80 |
+
+### num_splits 平均（triton_fused）
+
+| num_splits | points | avg latency ms | avg BW GB/s | avg DRAM % | avg occ % | avg regs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 12 | 0.6690 | 566.3 | 36.4 | 25.3 | 104 |
+| 4 | 18 | 0.5733 | 605.2 | 38.9 | 27.6 | 111 |
+| 8 | 18 | 0.7007 | 612.3 | 39.4 | 28.3 | 111 |
+
+### block_n × num_warps 平均（triton_paged）
+
+| block_n | num_warps | points | avg latency ms | avg BW GB/s | avg DRAM % | avg occ % | avg regs |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 12 | 0.4284 | 657.2 | 42.3 | 15.5 | 168 |
+| 128 | 8 | 12 | 0.5588 | 491.0 | 31.6 | 22.7 | 128 |
+| 64 | 4 | 12 | 0.4876 | 574.9 | 37.0 | 26.0 | 96 |
+| 64 | 8 | 12 | 0.8391 | 322.0 | 20.7 | 22.8 | 116 |
+| 32 | 4 | 12 | 0.6789 | 396.5 | 25.5 | 27.4 | 72 |
+| 32 | 8 | 12 | 1.2063 | 223.1 | 14.3 | 31.6 | 80 |
+
+### paged_layout 平均（triton_paged）
+
+| paged_layout | points | avg latency ms | avg BW GB/s | avg DRAM % | avg occ % | avg regs |
+|---|---:|---:|---:|---:|---:|---:|
+| contiguous | 24 | 0.6935 | 443.7 | 28.5 | 24.3 | 110 |
+| interleaved | 24 | 0.6966 | 446.0 | 28.7 | 24.3 | 110 |
+| shuffled | 24 | 0.7095 | 442.7 | 28.5 | 24.3 | 110 |
+
+速查表要点：`block_n=128 + num_warps=4` 在两条路径上都是最快组合；`num_splits=4` 在 fused 上最优；paged 三种 layout 平均 latency 几乎持平（contiguous 略优），说明当前 paged 开销主要来自 block_table 地址计算而非物理布局局部性。
+
 ## 安装
 
 基础安装：

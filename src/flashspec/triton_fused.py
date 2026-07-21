@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import math
@@ -26,7 +27,215 @@ from .quant import QuantizedTensor, estimate_quantized_bytes
 from .triton_utils import HAS_TRITON, next_power_of_2, tl, triton
 
 
+@dataclass(frozen=True)
+class FusedKVBuffers:
+    """两个 fused kernel 共享的 query / INT8 KV / lengths 输入指针。
+
+    把 8 个 tensor 参数收拢成一个对象，避免 launcher 里逐个平铺、错位传参。
+    字段顺序与 kernel signature 的前 8 个位置参数严格对应。
+    """
+
+    q: torch.Tensor
+    k_values: torch.Tensor
+    k_scale: torch.Tensor
+    k_zero: torch.Tensor
+    v_values: torch.Tensor
+    v_scale: torch.Tensor
+    v_zero: torch.Tensor
+    lengths: torch.Tensor
+
+    def as_args(self) -> tuple:
+        """按 kernel signature 顺序返回输入 tensor 的位置参数元组。"""
+
+        return (
+            self.q,
+            self.k_values,
+            self.k_scale,
+            self.k_zero,
+            self.v_values,
+            self.v_scale,
+            self.v_zero,
+            self.lengths,
+        )
+
+
+@dataclass(frozen=True)
+class FusedAttentionMeta:
+    """两个 fused kernel 共享的 constexpr 元参数与 launch 配置。
+
+    这些值决定 kernel 的地址计算、softmax 缩放、tile 尺寸和 warp 数。
+    core_args() 给出单 kernel 也需要的公共 constexpr；split kernel 额外的
+    num_splits/chunk_tokens 由 launcher 单独插入，避免污染公共顺序。
+    """
+
+    heads: int
+    seq_len: int
+    head_dim: int
+    n_blocks: int
+    block_size: int
+    sm_scale: float
+    has_lengths: bool
+    num_splits: int
+    chunk_tokens: int
+    block_n: int
+    block_d: int
+    num_warps: int
+
+    def core_args(self) -> tuple:
+        """返回单 kernel 与 split kernel 公共的 constexpr（不含 Split-K 专有项）。"""
+
+        return (
+            self.heads,
+            self.seq_len,
+            self.head_dim,
+            self.n_blocks,
+            self.block_size,
+            self.sm_scale,
+            self.has_lengths,
+        )
+
+
 if HAS_TRITON:
+
+    @triton.jit
+    def _pid_to_batch_head(pid, heads: tl.constexpr):
+        """把展平后的 program id 还原成 batch/head 下标。"""
+
+        batch_idx = pid // heads
+        head_idx = pid - batch_idx * heads
+        return batch_idx, head_idx
+
+    @triton.jit
+    def _make_dim_offsets(head_dim: tl.constexpr, block_d: tl.constexpr):
+        """生成 head_dim 维度上的向量化偏移和 padding mask。"""
+
+        offs_d = tl.arange(0, block_d)
+        d_mask = offs_d < head_dim
+        return offs_d, d_mask
+
+    @triton.jit
+    def _load_query(
+        q_ptr,
+        batch_idx,
+        head_idx,
+        heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        offs_d,
+        d_mask,
+    ):
+        """读取当前 [batch, head] 的 query 向量，并返回它的展平 base 地址。"""
+
+        q_base = (batch_idx * heads + head_idx) * head_dim
+        q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        return q_base, q
+
+    @triton.jit
+    def _effective_length(
+        lengths_ptr,
+        batch_idx,
+        seq_len: tl.constexpr,
+        has_lengths: tl.constexpr,
+    ):
+        """返回当前 batch 的有效 sequence 长度。"""
+
+        effective_len = seq_len
+        if has_lengths:
+            loaded_len = tl.load(lengths_ptr + batch_idx)
+            effective_len = tl.minimum(loaded_len, seq_len)
+        return effective_len
+
+    @triton.jit
+    def _fused_attention_tile(
+        q,
+        m,
+        l,
+        acc,
+        k_values_ptr,
+        k_scale_ptr,
+        k_zero_point_ptr,
+        v_values_ptr,
+        v_scale_ptr,
+        v_zero_point_ptr,
+        batch_idx,
+        head_idx,
+        offs_s,
+        s_mask,
+        offs_d,
+        d_mask,
+        heads: tl.constexpr,
+        n_blocks: tl.constexpr,
+        block_size: tl.constexpr,
+        head_dim: tl.constexpr,
+        sm_scale: tl.constexpr,
+    ):
+        """处理一个 token tile，并更新 online softmax 状态。
+
+        该 helper 同时服务单 kernel 和 Split-K split kernel。调用方负责提供
+        offs_s/s_mask，因此单 kernel 可以传完整长度 mask，split kernel 可以额外
+        叠加 split_end mask。函数内部只关注连续 INT8 KV 的地址计算、反量化和
+        attention 状态更新。
+        """
+
+        # 将 sequence 位置映射到量化 block 编号和 block 内偏移。
+        # quant_block: token 属于第几个量化 block。
+        # block_offset: token 在这个量化 block 内的 offset。
+        quant_block = offs_s // block_size
+        block_offset = offs_s - quant_block * block_size
+
+        # QuantizedTensor.values 的布局是：
+        # [batch, heads, n_blocks, block_size, head_dim]。
+        # kv_offsets 是二维地址矩阵 [block_n, block_d]，指向当前 token tile 的 K/V 元素。
+        kv_offsets = (
+            ((((batch_idx * heads + head_idx) * n_blocks + quant_block[:, None]) * block_size + block_offset[:, None])
+             * head_dim)
+            + offs_d[None, :]
+        )
+        # kv_mask 同时屏蔽无效 token 和 head_dim padding 列。
+        kv_mask = s_mask[:, None] & d_mask[None, :]
+
+        # scale/zero_point 的布局是 [batch, heads, n_blocks, 1, 1]，
+        # 因此展平后每个 [batch, head, quant_block] 对应一个参数。
+        # qparam_offsets 是 [block_n]，每个 token 对应一个量化参数地址。
+        qparam_offsets = (batch_idx * heads + head_idx) * n_blocks + quant_block
+        k_scale = tl.load(k_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
+        k_zero = tl.load(k_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
+
+        # values 以 signed int8 保存，真实 uint8 逻辑值需要 +128。
+        # 反量化公式：x = (uint8_value - zero_point) * scale。
+        # k_deq 形状 [block_n, block_d]，只在寄存器中存在。
+        k_i8 = tl.load(k_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
+        k_deq = (k_i8 + 128.0 - k_zero[:, None]) * k_scale[:, None]
+
+        # scores: [block_n]，表示当前 q 对这一段历史 K 的注意力分数。
+        scores = tl.sum(k_deq * q[None, :], axis=1) * sm_scale
+        scores = tl.where(s_mask, scores, -3.4028234663852886e38)
+
+        # online softmax 更新。这样不需要先保存完整 [seq_len] scores。
+        block_m = tl.max(scores, axis=0)
+        new_m = tl.maximum(m, block_m)
+        old_scale = tl.exp(m - new_m)
+        probs = tl.exp(scores - new_m)
+        probs = tl.where(s_mask, probs, 0.0)
+        new_l = l * old_scale + tl.sum(probs, axis=0)
+
+        # V 使用和 K 相同的 int8/scale/zero_point 布局与反量化公式。
+        v_scale = tl.load(v_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
+        v_zero = tl.load(v_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
+        v_i8 = tl.load(v_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
+        # v_deq 形状 [block_n, block_d]；与 probs[:, None] 相乘后按 token 维求和。
+        v_deq = (v_i8 + 128.0 - v_zero[:, None]) * v_scale[:, None]
+
+        # 累积 PV。acc 始终和当前 new_m 对齐，避免 softmax 溢出。
+        acc = acc * old_scale + tl.sum(probs[:, None] * v_deq, axis=0)
+        return new_m, new_l, acc
+
+    @triton.jit
+    def _normalize_acc(acc, l):
+        """将未归一化 PV 累积除以 softmax 分母；空序列输出 0。"""
+
+        denom = tl.where(l > 0.0, l, 1.0)
+        out = acc / denom
+        return tl.where(l > 0.0, out, 0.0)
 
     @triton.jit
     def _fused_dequant_attention_kernel(
@@ -92,25 +301,19 @@ if HAS_TRITON:
 
         # 从 pid 还原 batch 下标和 head 下标：
         # pid = batch_idx * heads + head_idx。
-        batch_idx = pid // heads
-        head_idx = pid - batch_idx * heads
+        batch_idx, head_idx = _pid_to_batch_head(pid, heads)
 
         # 当前 head 内的 feature/head_dim 下标。
         # offs_d 长度是 block_d，可能大于真实 head_dim；d_mask 屏蔽 padding lane。
-        offs_d = tl.arange(0, block_d)
-        d_mask = offs_d < head_dim
+        offs_d, d_mask = _make_dim_offsets(head_dim, block_d)
 
         # q 的布局是 [batch, heads, head_dim]，这里读取当前 [batch, head] 的 q 向量。
         # q_base 是这个向量在展平内存中的起始元素下标。
-        q_base = (batch_idx * heads + head_idx) * head_dim
-        q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        q_base, q = _load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
 
         # effective_len 表示当前 batch 真实参与 attention 的 token 数。
         # 如果传入 lengths，则每个 batch 可以有不同有效长度；否则默认 seq_len 全有效。
-        effective_len = seq_len
-        if has_lengths:
-            loaded_len = tl.load(lengths_ptr + batch_idx)
-            effective_len = tl.minimum(loaded_len, seq_len)
+        effective_len = _effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
 
         # online softmax 的状态：
         # m 是当前已扫描 scores 的最大值；
@@ -128,65 +331,33 @@ if HAS_TRITON:
             offs_s = start + tl.arange(0, block_n)
             s_mask = offs_s < effective_len
 
-            # 将 sequence 位置映射到量化 block 编号和 block 内偏移。
-            # quant_block: token 属于第几个量化 block。
-            # block_offset: token 在这个量化 block 内的 offset。
-            quant_block = offs_s // block_size
-            block_offset = offs_s - quant_block * block_size
-
-            # QuantizedTensor.values 的布局是：
-            # [batch, heads, n_blocks, block_size, head_dim]。
-            # kv_offsets 是二维地址矩阵 [block_n, block_d]，指向当前 token tile 的 K/V 元素。
-            kv_offsets = (
-                ((((batch_idx * heads + head_idx) * n_blocks + quant_block[:, None]) * block_size + block_offset[:, None])
-                 * head_dim)
-                + offs_d[None, :]
+            m, l, acc = _fused_attention_tile(
+                q,
+                m,
+                l,
+                acc,
+                k_values_ptr,
+                k_scale_ptr,
+                k_zero_point_ptr,
+                v_values_ptr,
+                v_scale_ptr,
+                v_zero_point_ptr,
+                batch_idx,
+                head_idx,
+                offs_s,
+                s_mask,
+                offs_d,
+                d_mask,
+                heads,
+                n_blocks,
+                block_size,
+                head_dim,
+                sm_scale,
             )
-            # kv_mask 同时屏蔽无效 token 和 head_dim padding 列。
-            kv_mask = s_mask[:, None] & d_mask[None, :]
-
-            # scale/zero_point 的布局是 [batch, heads, n_blocks, 1, 1]，
-            # 因此展平后每个 [batch, head, quant_block] 对应一个参数。
-            # qparam_offsets 是 [block_n]，每个 token 对应一个量化参数地址。
-            qparam_offsets = (batch_idx * heads + head_idx) * n_blocks + quant_block
-            k_scale = tl.load(k_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
-            k_zero = tl.load(k_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
-
-            # values 以 signed int8 保存，真实 uint8 逻辑值需要 +128。
-            # 反量化公式：x = (uint8_value - zero_point) * scale。
-            # k_deq 形状 [block_n, block_d]，只在寄存器中存在。
-            k_i8 = tl.load(k_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
-            k_deq = (k_i8 + 128.0 - k_zero[:, None]) * k_scale[:, None]
-
-            # scores: [block_n]，表示当前 q 对这一段历史 K 的注意力分数。
-            scores = tl.sum(k_deq * q[None, :], axis=1) * sm_scale
-            scores = tl.where(s_mask, scores, -3.4028234663852886e38)
-
-            # online softmax 更新。这样不需要先保存完整 [seq_len] scores。
-            block_m = tl.max(scores, axis=0)
-            new_m = tl.maximum(m, block_m)
-            old_scale = tl.exp(m - new_m)
-            probs = tl.exp(scores - new_m)
-            probs = tl.where(s_mask, probs, 0.0)
-            new_l = l * old_scale + tl.sum(probs, axis=0)
-
-            # V 使用和 K 相同的 int8/scale/zero_point 布局与反量化公式。
-            v_scale = tl.load(v_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
-            v_zero = tl.load(v_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
-            v_i8 = tl.load(v_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
-            # v_deq 形状 [block_n, block_d]；与 probs[:, None] 相乘后按 token 维求和。
-            v_deq = (v_i8 + 128.0 - v_zero[:, None]) * v_scale[:, None]
-
-            # 累积 PV。acc 始终和当前 new_m 对齐，避免 softmax 溢出。
-            acc = acc * old_scale + tl.sum(probs[:, None] * v_deq, axis=0)
-            m = new_m
-            l = new_l
 
         # 如果 effective_len 为 0，l 会保持 0；这种异常输入下输出置 0。
         # 先保护分母，避免先执行 acc / 0 再 where 造成无效浮点中间值。
-        denom = tl.where(l > 0.0, l, 1.0)
-        out = acc / denom
-        out = tl.where(l > 0.0, out, 0.0)
+        out = _normalize_acc(acc, l)
 
         # 输出布局是 [batch, heads, head_dim]，与 q 一致。
         tl.store(out_ptr + q_base + offs_d, out, mask=d_mask)
@@ -252,21 +423,15 @@ if HAS_TRITON:
         pid = tl.program_id(0)
         split_id = tl.program_id(1)
 
-        batch_idx = pid // heads
-        head_idx = pid - batch_idx * heads
+        batch_idx, head_idx = _pid_to_batch_head(pid, heads)
 
-        offs_d = tl.arange(0, block_d)
-        d_mask = offs_d < head_dim
+        offs_d, d_mask = _make_dim_offsets(head_dim, block_d)
 
         # q_base 指向当前 [batch, head] query 向量。
-        q_base = (batch_idx * heads + head_idx) * head_dim
-        q = tl.load(q_ptr + q_base + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+        q_base, q = _load_query(q_ptr, batch_idx, head_idx, heads, head_dim, offs_d, d_mask)
 
         # effective_len 用于 variable length；超过该长度的 token 不参与当前 split。
-        effective_len = seq_len
-        if has_lengths:
-            loaded_len = tl.load(lengths_ptr + batch_idx)
-            effective_len = tl.minimum(loaded_len, seq_len)
+        effective_len = _effective_length(lengths_ptr, batch_idx, seq_len, has_lengths)
 
         # 本段负责的 token 区间。split_end 不超过 seq_len。
         # 例如 seq_len=2048,num_splits=4 时，通常每段约 512 个 token。
@@ -284,40 +449,29 @@ if HAS_TRITON:
             offs_s = split_start + local + tl.arange(0, block_n)
             s_mask = (offs_s < effective_len) & (offs_s < split_end)
 
-            quant_block = offs_s // block_size
-            block_offset = offs_s - quant_block * block_size
-
-            kv_offsets = (
-                ((((batch_idx * heads + head_idx) * n_blocks + quant_block[:, None]) * block_size + block_offset[:, None])
-                 * head_dim)
-                + offs_d[None, :]
+            m, l, acc = _fused_attention_tile(
+                q,
+                m,
+                l,
+                acc,
+                k_values_ptr,
+                k_scale_ptr,
+                k_zero_point_ptr,
+                v_values_ptr,
+                v_scale_ptr,
+                v_zero_point_ptr,
+                batch_idx,
+                head_idx,
+                offs_s,
+                s_mask,
+                offs_d,
+                d_mask,
+                heads,
+                n_blocks,
+                block_size,
+                head_dim,
+                sm_scale,
             )
-            kv_mask = s_mask[:, None] & d_mask[None, :]
-
-            qparam_offsets = (batch_idx * heads + head_idx) * n_blocks + quant_block
-            k_scale = tl.load(k_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
-            k_zero = tl.load(k_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
-            k_i8 = tl.load(k_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
-            k_deq = (k_i8 + 128.0 - k_zero[:, None]) * k_scale[:, None]
-
-            scores = tl.sum(k_deq * q[None, :], axis=1) * sm_scale
-            scores = tl.where(s_mask, scores, -3.4028234663852886e38)
-
-            block_m = tl.max(scores, axis=0)
-            new_m = tl.maximum(m, block_m)
-            old_scale = tl.exp(m - new_m)
-            probs = tl.exp(scores - new_m)
-            probs = tl.where(s_mask, probs, 0.0)
-            new_l = l * old_scale + tl.sum(probs, axis=0)
-
-            v_scale = tl.load(v_scale_ptr + qparam_offsets, mask=s_mask, other=1.0).to(tl.float32)
-            v_zero = tl.load(v_zero_point_ptr + qparam_offsets, mask=s_mask, other=0).to(tl.float32)
-            v_i8 = tl.load(v_values_ptr + kv_offsets, mask=kv_mask, other=-128).to(tl.float32)
-            v_deq = (v_i8 + 128.0 - v_zero[:, None]) * v_scale[:, None]
-
-            acc = acc * old_scale + tl.sum(probs[:, None] * v_deq, axis=0)
-            m = new_m
-            l = new_l
 
         # 写出本段 partial 状态到 scratch，供 combine kernel 合并。
         # partial_m/l 布局 [batch*heads, num_splits]，partial_acc 布局 [..., head_dim]。
@@ -383,9 +537,7 @@ if HAS_TRITON:
             acc = acc * old_scale + pacc * cur_scale
             m = new_m
 
-        denom = tl.where(l > 0.0, l, 1.0)
-        out = acc / denom
-        out = tl.where(l > 0.0, out, 0.0)
+        out = _normalize_acc(acc, l)
         tl.store(out_ptr + pid * head_dim + offs_d, out, mask=d_mask)
 
 
@@ -607,36 +759,52 @@ def _run_fused_dequant_attention_triton(
 
     # num_splits 控制数据路径：1=单 kernel，>1=Split-K split+combine。
     num_splits = _compute_num_splits(seq_len, block_n)
+    # chunk_tokens 只有 Split-K 路径用到；单 kernel 时值不参与 launch。
+    # 向上取整到 block_n 的整数倍，使 split kernel 内层循环恰好覆盖本段。
+    chunk_tokens = ((seq_len + num_splits - 1) // num_splits + block_n - 1) // block_n * block_n
+
+    # 把逐个平铺的 tensor 指针和 constexpr 元参数收拢成两个对象，
+    # 让单 kernel 和 Split-K 两阶段从同一份参数按固定顺序组装 launch。
+    buffers = FusedKVBuffers(
+        q=q_contig,
+        k_values=k_values,
+        k_scale=k_scale,
+        k_zero=k_zero,
+        v_values=v_values,
+        v_scale=v_scale,
+        v_zero=v_zero,
+        lengths=lengths_contig,
+    )
+    meta = FusedAttentionMeta(
+        heads=heads,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        n_blocks=n_blocks,
+        block_size=block_size,
+        sm_scale=sm_scale,
+        has_lengths=lengths is not None,
+        num_splits=num_splits,
+        chunk_tokens=chunk_tokens,
+        block_n=block_n,
+        block_d=block_d,
+        num_warps=num_warps,
+    )
 
     if num_splits == 1:
         # S==1 快路径：直接用原单 kernel 写 out，不分配 scratch、不启 combine。
         grid = (batch * heads,)
         _fused_dequant_attention_kernel[grid](
-            q_contig,
-            k_values,
-            k_scale,
-            k_zero,
-            v_values,
-            v_scale,
-            v_zero,
-            lengths_contig,
+            *buffers.as_args(),
             out,
-            heads,
-            seq_len,
-            head_dim,
-            n_blocks,
-            block_size,
-            sm_scale,
-            lengths is not None,
-            block_n,
-            block_d,
-            num_warps=num_warps,
+            *meta.core_args(),
+            meta.block_n,
+            meta.block_d,
+            num_warps=meta.num_warps,
         )
     else:
         # Split-K：把 seq_len 切成 num_splits 段并行，grid=(batch*heads, S)。
-        # chunk_tokens 向上取整到 block_n 的整数倍，使 split kernel 内层循环恰好
+        # chunk_tokens 已在上面按 block_n 对齐，使 split kernel 内层循环恰好
         # 覆盖本段，尾段用 mask 处理不整除。
-        chunk_tokens = ((seq_len + num_splits - 1) // num_splits + block_n - 1) // block_n * block_n
         # rows 是展平后的 [batch, head] 数，也是 combine kernel 的 program 数。
         rows = batch * heads
         # scratch：partial 状态，不是 dense KV。
@@ -649,39 +817,26 @@ def _run_fused_dequant_attention_triton(
         partial_acc = torch.empty((rows, num_splits, head_dim), device=q_contig.device, dtype=torch.float32)
 
         _fused_dequant_attention_split_kernel[(rows, num_splits)](
-            q_contig,
-            k_values,
-            k_scale,
-            k_zero,
-            v_values,
-            v_scale,
-            v_zero,
-            lengths_contig,
+            *buffers.as_args(),
             partial_m,
             partial_l,
             partial_acc,
-            heads,
-            seq_len,
-            head_dim,
-            n_blocks,
-            block_size,
-            sm_scale,
-            lengths is not None,
-            num_splits,
-            chunk_tokens,
-            block_n,
-            block_d,
-            num_warps=num_warps,
+            *meta.core_args(),
+            meta.num_splits,
+            meta.chunk_tokens,
+            meta.block_n,
+            meta.block_d,
+            num_warps=meta.num_warps,
         )
         _combine_splits_kernel[(rows,)](
             partial_m,
             partial_l,
             partial_acc,
             out,
-            num_splits,
-            head_dim,
-            block_d,
-            num_warps=num_warps,
+            meta.num_splits,
+            meta.head_dim,
+            meta.block_d,
+            num_warps=meta.num_warps,
         )
 
     if not return_stats:

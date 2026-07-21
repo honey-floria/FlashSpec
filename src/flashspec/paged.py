@@ -380,9 +380,10 @@ class PagedKVCache:
         block_table = torch.arange(total_blocks, dtype=torch.int64, device=k.device).reshape(batch, blocks_per_seq)
 
         pattern = block_table_pattern.strip().lower()
-        if pattern in {"contiguous", ""}:
-            pass
-        elif pattern in {"shuffled", "random"}:
+        if pattern not in {"contiguous", "", "shuffled", "random", "interleaved"}:
+            raise ValueError("block_table_pattern 必须是 contiguous、shuffled 或 interleaved")
+
+        if pattern in {"shuffled", "random"}:
             generator = torch.Generator(device=k.device)
             generator.manual_seed(int(layout_seed))
             perm = torch.randperm(total_blocks, generator=generator, device=k.device)
@@ -401,8 +402,6 @@ class PagedKVCache:
             inverse = torch.empty_like(perm)
             inverse[perm] = torch.arange(total_blocks, dtype=torch.int64, device=k.device)
             block_table = inverse.reshape(batch, blocks_per_seq)
-        else:
-            raise ValueError("block_table_pattern 必须是 contiguous、shuffled 或 interleaved")
 
         if lengths is None:
             effective_lengths = torch.full((batch,), seq_len, dtype=torch.int64, device=k.device)

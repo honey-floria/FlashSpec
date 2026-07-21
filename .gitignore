@@ -10,6 +10,6 @@ results/colab_kernels/*.json
 results/profile_matrix/**/*.json
 
 # IDE / 编辑器
+.claude/
 .idea/
 .vscode/
-
